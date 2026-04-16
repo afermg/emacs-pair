@@ -262,25 +262,31 @@ while mu4e is running. Use `(mu4e-update-mail-and-index t)` instead.
 
 ### Sending email programmatically
 
-Interactive `message-send-and-exit` prompts for confirmations that hang
-emacsclient. Suppress them with `cl-letf`:
+Use `mu4e-compose-mail` to create compose buffers — it properly sets up Fcc
+headers, hooks, and mu4e integration. Using `message-setup` directly skips
+mu4e's machinery (no Fcc, no sent-folder save, no context switching).
+
+Interactive prompts (`y-or-n-p`, "Fix continuation lines?") hang emacsclient.
+Suppress them with `cl-letf`:
 
 ```elisp
-(let ((buf (generate-new-buffer "*compose*")))
-  (with-current-buffer buf
-    (mu4e-compose-mode)
-    (message-setup '((To . "recipient@example.com")
-                     (Subject . "Test")
-                     (From . "sender@example.com")))
-    (message-goto-body)
-    (insert "Body text here.\n")
-    (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
-              ((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
-      (message-send-and-exit))))
+;; Preferred: uses mu4e-compose-mail for full mu4e integration (Fcc, sent folder)
+(progn
+  (mu4e-compose-mail "recipient@example.com" "Subject line")
+  (let ((buf (car (seq-filter (lambda (b)
+                                (with-current-buffer b
+                                  (derived-mode-p 'mu4e-compose-mode)))
+                              (buffer-list)))))
+    (with-current-buffer buf
+      (message-goto-body)
+      (insert "Body text here.\n")
+      (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+                ((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+        (message-send-and-exit)))))
 ```
 
-Alternatively, for simpler sends, bypass message-mode entirely and pipe through
-`msmtp` directly:
+For fire-and-forget sends where you don't need sent-folder integration,
+bypass message-mode entirely and pipe through `msmtp`:
 
 ```elisp
 (with-temp-buffer
@@ -290,6 +296,8 @@ Alternatively, for simpler sends, bypass message-mode entirely and pipe through
   (call-process-region (point-min) (point-max) "msmtp" nil nil nil
                        "--read-envelope-from" "-t"))
 ```
+
+This won't save to Sent — use it only for quick one-off sends where that's OK.
 
 ### Searching contacts
 
