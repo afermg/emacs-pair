@@ -4,7 +4,11 @@ description: >-
   Work inside a running Emacs session — read and write buffers, evaluate Elisp,
   run M-x commands, and inspect editor state. Use when the user wants you to
   interact with their live Emacs: read a buffer, modify text, run a command,
-  configure something, or debug Elisp in their actual session.
+  configure something, or debug Elisp in their actual session. Also covers
+  working with Emacs packages like elfeed (RSS), mu4e (email), org-mode, and
+  any Emacs subsystem accessible through Elisp. Use this whenever the user
+  mentions Emacs buffers, elfeed feeds, mu4e mail, org files open in Emacs,
+  or wants to evaluate Elisp.
 allowed-tools: Bash(bash **/scripts/discover-servers.sh *), Bash(bash **/scripts/eval-elisp.sh *)
 ---
 
@@ -198,10 +202,157 @@ Common causes:
 - **`No buffer named "..."`** — buffer not open; use `find-file` or `get-buffer-create`
 - **Server not responding** — run `discover-servers.sh` to confirm the socket is live
 
+## Batch Edits via Elisp Files
+
+For large operations (many line edits, bulk refiling), generate a `.el` file and
+evaluate it with `eval-elisp.sh /tmp/my-edits.el`. This avoids shell quoting
+issues and the `progn` wrapping heuristic in eval-elisp.sh.
+
+When generating Elisp programmatically (e.g., from Python):
+- **Validate paren balance** before writing — count `(` and `)` in the output
+- **Process lines in reverse order** when deleting/replacing by line number, so
+  earlier indices remain valid
+- **Escape strings properly**: backslashes first (`\\` → `\\\\`), then quotes (`"` → `\\"`)
+- Wrap everything in a single top-level form (e.g., `with-current-buffer ... save-excursion`)
+  rather than multiple top-level expressions — eval-elisp.sh's `progn` wrapper
+  can misfire on complex multi-expression files
+
+**Example pattern for bulk line edits:**
+```python
+lines = ['(with-current-buffer (find-file-noselect "/path/to/file.org")']
+lines.append('  (save-excursion')
+for line_idx, new_line in sorted(edits, reverse=True):
+    esc = new_line.replace('\\', '\\\\').replace('"', '\\"')
+    lines.append(f'    (goto-char (point-min))')
+    lines.append(f'    (forward-line {line_idx})')
+    lines.append(f'    (delete-region (line-beginning-position) (line-end-position))')
+    lines.append(f'    (insert "{esc}")')
+lines.append('  )')
+lines.append('  (save-buffer))')
+```
+
+## Working with Elfeed
+
+Elfeed stores its database in memory. Access entries via `elfeed-search-entries`
+(in the `*elfeed-search*` buffer) or traverse the full database:
+
+```elisp
+;; Iterate all entries for a specific feed URL
+(with-elfeed-db-visit (entry feed-obj)
+  (when (equal (elfeed-feed-url feed-obj) "https://example.com/feed")
+    ;; entry is an elfeed-entry struct
+    (elfeed-entry-title entry)
+    (elfeed-deref (elfeed-entry-content entry))  ; returns HTML string or nil
+    (elfeed-entry-tags entry)))                   ; returns list of symbols
+```
+
+Key functions:
+- `elfeed-entry-feed` → the feed object for an entry
+- `elfeed-feed-title` / `elfeed-feed-url` → feed metadata
+- `elfeed-deref` — dereferences content (which is stored lazily)
+- `elfeed-db-get-feed` — look up a feed by URL
+- Content length from `elfeed-deref` is a good proxy for full-article vs
+  headers-only classification (>1500 chars ≈ full article, <300 ≈ headers only)
+
+## Working with mu4e
+
+mu4e runs as a server process inside Emacs that talks to the `mu` binary. The
+database lock belongs to this server — don't call `mu index` from the shell
+while mu4e is running. Use `(mu4e-update-mail-and-index t)` instead.
+
+### Sending email programmatically
+
+Interactive `message-send-and-exit` prompts for confirmations that hang
+emacsclient. Suppress them with `cl-letf`:
+
+```elisp
+(let ((buf (generate-new-buffer "*compose*")))
+  (with-current-buffer buf
+    (mu4e-compose-mode)
+    (message-setup '((To . "recipient@example.com")
+                     (Subject . "Test")
+                     (From . "sender@example.com")))
+    (message-goto-body)
+    (insert "Body text here.\n")
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+      (message-send-and-exit))))
+```
+
+Alternatively, for simpler sends, bypass message-mode entirely and pipe through
+`msmtp` directly:
+
+```elisp
+(with-temp-buffer
+  (insert "From: sender@example.com\nTo: recipient@example.com\n")
+  (insert "Subject: Test\nContent-Type: text/plain; charset=utf-8\n\n")
+  (insert "Body here.\n")
+  (call-process-region (point-min) (point-max) "msmtp" nil nil nil
+                       "--read-envelope-from" "-t"))
+```
+
+### Searching contacts
+
+mu4e 1.12+ stores contacts in `mu4e--contacts-set` (a hash table keyed by
+email address string):
+
+```elisp
+(maphash (lambda (addr props)
+           (when (string-match-p "pattern" (downcase addr))
+             ...))
+         mu4e--contacts-set)
+```
+
+### Mode compatibility with modal editors (meow, evil)
+
+mu4e buffers (main, headers, view, compose) use their own single-key bindings
+(`q`, `n`, `d`, etc.) that conflict with modal editing normal mode. Add hooks
+to switch to insert/emacs state. Note that `mu4e-view-mode` derives from
+`gnus-article-mode`, so you need *both* hooks:
+
+```elisp
+(dolist (hook '(mu4e-main-mode-hook
+                mu4e-headers-mode-hook
+                mu4e-view-mode-hook
+                mu4e-compose-mode-hook
+                gnus-article-mode-hook))
+  (add-hook hook #'meow-insert-mode))  ; or #'evil-emacs-state
+```
+
+## Working with Org Files via Elisp
+
+When editing org files that Emacs has open, always go through the buffer:
+
+```elisp
+(with-current-buffer (find-file-noselect "/path/to/file.org")
+  (save-excursion
+    ;; Navigate by line number (0-indexed with forward-line)
+    (goto-char (point-min))
+    (forward-line 41)  ; go to line 42
+    ;; Read the line
+    (buffer-substring (line-beginning-position) (line-end-position))
+    ;; Replace the line
+    (delete-region (line-beginning-position) (line-end-position))
+    (insert "new content"))
+  (save-buffer))
+```
+
+For refiling (moving headings between subtrees), collect text in reverse line
+order, delete each line, then insert the collected text under the target heading.
+
 ## Guard Rails
 
 - **Never write to a file on disk while Emacs has it open** — use `insert`/`save-buffer` instead
 - **Avoid `kill-buffer` without asking** — it's destructive and loses unsaved changes
 - **Don't run blocking commands** like `read-string` or `yes-or-no-p` interactively —
-  they'll hang `emacsclient`. Use non-interactive forms instead
+  they'll hang `emacsclient`. Use non-interactive forms instead. When calling
+  functions that might prompt, wrap with `cl-letf` to override `y-or-n-p` and
+  `yes-or-no-p`
 - **Use `save-excursion`** whenever you move point and don't want to disturb the user
+- **Large outputs**: `emacsclient --eval` returns the full Lisp read-syntax of the
+  result. For large strings, the output may be truncated or slow. For bulk data
+  extraction, write results to a temp file from Elisp and read it back, or
+  format output as a structured string you can parse
+- **Database locks**: Tools like `mu` and `elfeed` maintain database locks. If Emacs
+  owns the lock (server is running), don't call the CLI tool directly for writes —
+  use the Emacs API instead (e.g., `mu4e-update-mail-and-index` not `mu index`)
