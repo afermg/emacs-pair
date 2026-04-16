@@ -260,6 +260,76 @@ mu4e runs as a server process inside Emacs that talks to the `mu` binary. The
 database lock belongs to this server — don't call `mu index` from the shell
 while mu4e is running. Use `(mu4e-update-mail-and-index t)` instead.
 
+### Installing mu4e from source via straight.el
+
+mu4e ships with the `mu` binary, not on MELPA. When `mu` is installed via Nix
+(or a package manager), mu4e elisp may not be bundled. Install via straight.el
+by cloning from GitHub and skipping the build step. The generated
+`mu4e-config.el` (normally created by meson) must be produced manually:
+
+```elisp
+(use-package mu4e
+  :straight (:host github :repo "djcb/mu"
+             :branch "release/1.12"
+             :files ("mu4e/*.el")
+             :pre-build ())
+  :init
+  ;; Generate mu4e-config.el from the installed mu binary
+  (let* ((build-dir (straight--build-dir "mu4e"))
+         (config-file (expand-file-name "mu4e-config.el" build-dir)))
+    (unless (file-exists-p config-file)
+      (let ((mu-ver (string-trim (shell-command-to-string "mu --version | grep -oP '\\d+\\.\\d+\\.\\d+'")))
+            (mu-bin (string-trim (shell-command-to-string "which mu"))))
+        (with-temp-file config-file
+          (insert ";;; mu4e-config.el --- auto-generated -*- lexical-binding: t -*-\n"
+                  (format "(defconst mu4e-mu-version \"%s\")\n" mu-ver)
+                  (format "(defconst mu4e-doc-dir \"%s\")\n"
+                          (expand-file-name "../share/doc/mu" (file-name-directory mu-bin)))
+                  "(provide 'mu4e-config)\n"))))))
+```
+
+### Multiple accounts with mu4e-contexts
+
+Use `mu4e-contexts` to switch between accounts. Each context sets the
+appropriate sent/drafts/trash folders and sender address. mu4e auto-detects
+context from the maildir when reading, and prompts when composing:
+
+```elisp
+(setq mu4e-contexts
+      (list
+       (make-mu4e-context
+        :name "personal"
+        :match-func (lambda (msg)
+                      (when msg
+                        (string-prefix-p "/personal" (mu4e-message-field msg :maildir))))
+        :vars '((user-mail-address  . "me@example.com")
+                (mu4e-sent-folder   . "/personal/Sent")
+                (mu4e-trash-folder  . "/personal/Trash")))
+       (make-mu4e-context
+        :name "work"
+        :match-func (lambda (msg)
+                      (when msg
+                        (string-prefix-p "/work" (mu4e-message-field msg :maildir))))
+        :vars '((user-mail-address  . "me@work.com")
+                ;; Gmail uses special folder names
+                (mu4e-sent-folder   . "/work/[Gmail]/Sent Mail")
+                (mu4e-trash-folder  . "/work/[Gmail]/Trash")))))
+```
+
+For Gmail accounts: IMAP folder names are `[Gmail]/Sent Mail`, `[Gmail]/Drafts`,
+`[Gmail]/Trash`. Requires an App Password (https://myaccount.google.com/apppasswords).
+
+### Credential management with rbw (Bitwarden)
+
+mbsync and msmtp both support external password commands. Use `rbw` (unofficial
+Bitwarden CLI with background agent) to avoid storing passwords on disk:
+
+- mbsync: `PassCmd "rbw get 'Entry Name'"`
+- msmtp: `passwordeval "rbw get 'Entry Name'"`
+
+If `rbw login` fails with pinentry errors over SSH, point it at `pinentry-tty`:
+`rbw config set pinentry /path/to/pinentry-tty`
+
 ### Sending email programmatically
 
 Use `mu4e-compose-mail` to create compose buffers — it properly sets up Fcc
