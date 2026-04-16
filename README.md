@@ -14,14 +14,21 @@ Or add `(server-start)` to your init file.
 
 ## Installation
 
-Copy or symlink this directory into your Claude Code skills folder:
+### As a plugin (recommended)
 
 ```bash
-# As a symlink
-ln -s /path/to/emacs-pair ~/.claude/skills/emacs-pair
+# Add the marketplace and install
+/plugin marketplace add afermg/emacs-pair
+/plugin install emacs-pair@afermg-emacs-pair
+```
 
-# Or clone directly
-git clone https://github.com/afermg/emacs-pair.git ~/.claude/skills/emacs-pair
+### Manual
+
+Clone the repo and symlink the skill directory:
+
+```bash
+git clone https://github.com/afermg/emacs-pair.git
+ln -s "$(pwd)/emacs-pair/skills/emacs-pair" ~/.claude/skills/emacs-pair
 ```
 
 Then invoke it in Claude Code with `/emacs-pair`.

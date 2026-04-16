@@ -1,0 +1,10 @@
+{
+  "name": "emacs-pair",
+  "description": "Pair program with Claude inside a running Emacs session — read/write buffers, evaluate Elisp, run M-x commands, and inspect editor state",
+  "version": "1.0.0",
+  "author": {
+    "name": "Alan F. Munoz"
+  },
+  "repository": "https://github.com/afermg/emacs-pair",
+  "license": "MIT"
+}
