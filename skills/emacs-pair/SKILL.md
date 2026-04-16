@@ -299,6 +299,33 @@ bypass message-mode entirely and pipe through `msmtp`:
 
 This won't save to Sent — use it only for quick one-off sends where that's OK.
 
+### Deleting / moving email programmatically
+
+`mu4e--server-move` requires a message docid (not a file path), which makes it
+awkward from non-interactive Elisp. The reliable approach is to move the maildir
+files directly, then sync:
+
+```elisp
+;; Move messages to Trash by renaming files in the maildir
+(let ((files '("/path/to/.mail/account/Inbox/cur/msg-file:2,S"))
+      (trash-dir "/path/to/.mail/account/Trash/cur/"))
+  (dolist (path files)
+    (when (file-exists-p path)
+      (let* ((basename (file-name-nondirectory path))
+             ;; Add T (trashed) flag to maildir flags
+             (new-name (if (string-match ":2,\\(.*\\)" basename)
+                           (let ((flags (match-string 1 basename)))
+                             (unless (string-match-p "T" flags)
+                               (replace-match (concat ":2," flags "T") nil nil basename)))
+                         basename)))
+        (rename-file path (concat trash-dir (or new-name basename)))))))
+;; Then sync so deletions propagate to the IMAP server
+(mu4e-update-mail-and-index t)
+```
+
+mbsync syncs bidirectionally — moving files to Trash locally propagates to the
+server, so changes will appear in webmail too.
+
 ### Searching contacts
 
 mu4e 1.12+ stores contacts in `mu4e--contacts-set` (a hash table keyed by
