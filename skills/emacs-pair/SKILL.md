@@ -410,19 +410,37 @@ email address string):
 
 ### Mode compatibility with modal editors (meow, evil)
 
-mu4e buffers (main, headers, view, compose) use their own single-key bindings
-(`q`, `n`, `d`, etc.) that conflict with modal editing normal mode. Add hooks
-to switch to insert/emacs state. Note that `mu4e-view-mode` derives from
-`gnus-article-mode`, so you need *both* hooks:
+Buffers like mu4e, magit, and other special-mode packages use their own
+single-key bindings (`q`, `n`, `d`, etc.) that conflict with modal editing
+normal mode. The reliable way to force insert state is `meow-mode-state-list`
+— hooks can be overridden by `meow-global-mode` re-entering normal state
+after the hook runs.
 
 ```elisp
-(dolist (hook '(mu4e-main-mode-hook
-                mu4e-headers-mode-hook
-                mu4e-view-mode-hook
-                mu4e-compose-mode-hook
-                gnus-article-mode-hook))
-  (add-hook hook #'meow-insert-mode))  ; or #'evil-emacs-state
+;; Preferred: meow-mode-state-list — meow checks this before choosing state
+(with-eval-after-load 'meow
+  (dolist (entry '((mu4e-main-mode . insert)
+                   (mu4e-headers-mode . insert)
+                   (mu4e-view-mode . insert)
+                   (mu4e-compose-mode . insert)
+                   (gnus-article-mode . insert)   ; mu4e view uses gnus-article-mode
+                   (magit-status-mode . insert)
+                   (magit-log-mode . insert)
+                   (magit-diff-mode . insert)))
+    (add-to-list 'meow-mode-state-list entry)))
 ```
+
+For evil-mode, use `evil-set-initial-state` instead:
+
+```elisp
+(evil-set-initial-state 'mu4e-main-mode 'emacs)
+(evil-set-initial-state 'magit-status-mode 'emacs)
+;; etc.
+```
+
+**Do not use hooks** like `(add-hook 'mu4e-view-mode-hook #'meow-insert-mode)`
+— `meow-global-mode` can override the state after the hook fires, making
+insert mode appear to not work.
 
 ## Working with Org Files via Elisp
 
