@@ -174,6 +174,48 @@ Strings come back quoted: `"hello"`. `nil` means no value or false. `t` means tr
   (org-clock-in))
 ```
 
+### TODO fast selection and buffer-local keyword state
+
+Org-mode TODO keyword settings (`org-todo-key-trigger`, `org-todo-key-alist`,
+`org-todo-kwd-alist`) are **buffer-local**, set by `org-set-regexps-and-options`
+when a buffer enters org-mode. This means:
+
+- If a file has a local `#+TODO:` line, it **overrides** the global
+  `org-todo-keywords` for that buffer.
+- If that local `#+TODO:` line omits selection keys (e.g.,
+  `#+TODO: TODO STARTED | DONE` instead of `#+TODO: TODO(t) STARTED(s) | DONE(d)`),
+  then `org-todo-key-trigger` will be nil in that buffer, and `C-c C-t` will
+  cycle states instead of showing the fast selection menu — even if
+  `org-use-fast-todo-selection` is `t`.
+- `org-use-fast-todo-selection` is also buffer-local; setting it globally with
+  `setq` won't affect already-open buffers.
+
+**Diagnosis checklist** when `C-c C-t` cycles instead of prompting:
+
+1. Check the buffer-local values:
+   ```elisp
+   (with-current-buffer "file.org"
+     (list :key-trigger (and org-todo-key-trigger t)
+           :fast-todo org-use-fast-todo-selection))
+   ```
+2. If `key-trigger` is nil, look for a local `#+TODO:` line in the file:
+   ```elisp
+   (with-current-buffer "file.org"
+     (save-excursion
+       (goto-char (point-min))
+       (re-search-forward "^#\\+TODO:" nil t)))
+   ```
+3. Fix: either remove the local `#+TODO:` line (to inherit global keywords with
+   selection keys) or add selection keys to it.
+
+**To fix all open buffers** in the current session after changing keywords:
+```elisp
+(dolist (buf (buffer-list))
+  (with-current-buffer buf
+    (when (derived-mode-p 'org-mode)
+      (org-set-regexps-and-options))))
+```
+
 ## Multiline Elisp Tips
 
 Shell quoting gets tricky with embedded strings. Always use a heredoc for
@@ -330,6 +372,99 @@ Bitwarden CLI with background agent) to avoid storing passwords on disk:
 If `rbw login` fails with pinentry errors over SSH, point it at `pinentry-tty`:
 `rbw config set pinentry /path/to/pinentry-tty`
 
+#### Handling rbw vault locking during mu4e sync
+
+When `rbw`'s vault locks (after `lock_timeout` expires or a reboot), `mbsync -a`
+fails because `rbw get` can't retrieve passwords. Since `mbsync` runs as a
+subprocess of mu4e, there's no TTY for `pinentry-tty` to prompt in.
+
+The solution has three layers of `:around` advice:
+
+1. **`mu4e-update-mail-and-index`** — background timer syncs silently skip when
+   locked; also enforces an Emacs-side session timeout (because rbw's own
+   `lock_timeout` resets on every `rbw get` call from mbsync)
+2. **`mu4e`** — when the user opens mu4e (`C-c m`) and rbw is locked, show the
+   unlock popup instead of launching mu4e (which would trigger a sync and hang)
+3. **`mu4e-rbw-unlock`** — interactive command that pops a term buffer for
+   password entry; sentinel auto-kills the buffer and opens mu4e on success
+
+**Pitfalls learned the hard way:**
+
+- **Don't use `mu4e-update-pre-hook` with `user-error`** — the error fights
+  with buffer display and freezes Emacs. Use `:around` advice instead.
+- **Don't open mu4e before unlocking** — mu4e's startup triggers a sync, which
+  hangs on locked rbw. Unlock first, open mu4e from the sentinel.
+- **Don't trust `rbw unlock` exit codes** — verify with `rbw unlocked` in the
+  sentinel instead.
+- **Don't swap `rbw config set pinentry` at runtime** — changing the config
+  kills the rbw agent and loses the unlocked session state.
+- **rbw's `lock_timeout` resets on every command** — if mu4e syncs every 5
+  minutes, `rbw get` keeps resetting the timer so the vault never locks.
+  Track unlock time in Emacs and enforce the timeout yourself.
+
+```elisp
+;; Emacs-side session tracking (rbw's own timer resets on every command)
+(defvar mu4e--rbw-unlock-time nil)
+(defconst mu4e--rbw-session-timeout (* 8 60 60))
+
+(defun mu4e--rbw-session-expired-p ()
+  (and mu4e--rbw-unlock-time
+       (> (float-time (time-subtract nil mu4e--rbw-unlock-time))
+          mu4e--rbw-session-timeout)))
+
+;; Interactive unlock — term buffer gives pinentry-tty a real TTY
+(defun mu4e-rbw-unlock ()
+  "Pop up a terminal to unlock rbw, then open mu4e."
+  (interactive)
+  (let ((buf (get-buffer-create "*rbw-unlock*")))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t)) (erase-buffer))
+      (term-mode)
+      (term-exec buf "rbw-unlock" "rbw" nil '("unlock"))
+      (term-char-mode)
+      (set-process-sentinel
+       (get-buffer-process buf)
+       (lambda (proc _event)
+         (when (memq (process-status proc) '(exit signal))
+           (when-let ((b (process-buffer proc)))
+             (when (buffer-live-p b)
+               (when-let ((w (get-buffer-window b t)))
+                 (delete-window w))
+               (kill-buffer b)))
+           (if (zerop (call-process "rbw" nil nil nil "unlocked"))
+               (progn
+                 (setq mu4e--rbw-unlock-time (current-time))
+                 (message "rbw unlocked — syncing mail...")
+                 (mu4e))
+             (message "rbw unlock failed — mail sync skipped"))))))
+    (display-buffer buf '((display-buffer-at-bottom) (window-height . 3)))
+    (select-window (get-buffer-window buf t))
+    (when (bound-and-true-p meow-mode) (meow-insert-mode))))
+
+;; Background syncs silently skip when locked or expired
+(defun mu4e--check-rbw-before-update (orig-fn &rest args)
+  (cond
+   ((mu4e--rbw-session-expired-p)
+    (call-process "rbw" nil nil nil "lock")
+    (setq mu4e--rbw-unlock-time nil)
+    (message "rbw session expired (8h) — run M-x mu4e-rbw-unlock to resume"))
+   ((not (zerop (call-process "rbw" nil nil nil "unlocked")))
+    (setq mu4e--rbw-unlock-time nil)
+    (message "rbw is locked — run M-x mu4e-rbw-unlock to resume"))
+   (t
+    (unless mu4e--rbw-unlock-time
+      (setq mu4e--rbw-unlock-time (current-time)))
+    (apply orig-fn args))))
+(advice-add 'mu4e-update-mail-and-index :around #'mu4e--check-rbw-before-update)
+
+;; Opening mu4e when locked → unlock first (don't launch mu4e, it would sync)
+(defun mu4e--check-rbw-on-launch (orig-fn &rest args)
+  (if (zerop (call-process "rbw" nil nil nil "unlocked"))
+      (apply orig-fn args)
+    (mu4e-rbw-unlock)))
+(advice-add 'mu4e :around #'mu4e--check-rbw-on-launch)
+```
+
 ### Sending email programmatically
 
 Use `mu4e-compose-mail` to create compose buffers — it properly sets up Fcc
@@ -462,6 +597,61 @@ When editing org files that Emacs has open, always go through the buffer:
 
 For refiling (moving headings between subtrees), collect text in reverse line
 order, delete each line, then insert the collected text under the target heading.
+
+## Managing Application Configs via NixOS / Home Manager
+
+This user manages their system declaratively with NixOS and Home Manager. When
+adding or modifying application configuration, prefer creating a declarative
+`.nix` module rather than editing dotfiles directly.
+
+### Two mechanisms for dotfile management
+
+1. **`xdg.configFile`** — for apps that use `~/.config/<app>/`. Create a
+   standalone `.nix` module, then import it in `homes/amunoz/home.nix`:
+
+   ```nix
+   # modules/shared/config/email/rbw.nix
+   { pkgs, ... }:
+   {
+     xdg.configFile."rbw/config.json" = {
+       text = builtins.toJSON {
+         lock_timeout = 28800;
+         pinentry = "${pkgs.pinentry-curses}/bin/pinentry-tty";
+       };
+     };
+   }
+   ```
+
+2. **`home.file`** — for apps that use `~/.<file>` (non-XDG). Defined in
+   `modules/shared/files.nix`:
+
+   ```nix
+   ".mbsyncrc" = {
+     text = builtins.readFile ../shared/config/email/mbsyncrc;
+   };
+   ```
+
+### Key patterns
+
+- **Reference Nix packages for paths** — use `"${pkgs.pinentry-curses}/bin/pinentry-tty"`
+  instead of hardcoded `/nix/store/...` paths. Hardcoded store paths break on
+  package updates.
+- **Use `builtins.toJSON`** for JSON configs — lets you write Nix attribute sets
+  that get serialized correctly.
+- **Use `builtins.readFile`** for configs that aren't easily expressed in Nix
+  (e.g., mbsyncrc, msmtprc).
+- **Standalone modules** — each app config gets its own `.nix` file under
+  `modules/shared/config/<category>/`, imported in `homes/amunoz/home.nix`:
+
+  ```nix
+  imports = [
+    ../../modules/shared/config/opencode/opencode.nix
+    ../../modules/shared/config/email/rbw.nix
+  ];
+  ```
+
+- **`onChange`** — use for post-deploy fixups like permissions:
+  `onChange = "chmod 600 $HOME/.msmtprc";`
 
 ## Guard Rails
 
