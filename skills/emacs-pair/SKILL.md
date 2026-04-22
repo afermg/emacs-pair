@@ -378,15 +378,9 @@ When `rbw`'s vault locks (after `lock_timeout` expires or a reboot), `mbsync -a`
 fails because `rbw get` can't retrieve passwords. Since `mbsync` runs as a
 subprocess of mu4e, there's no TTY for `pinentry-tty` to prompt in.
 
-The solution has three layers of `:around` advice:
-
-1. **`mu4e-update-mail-and-index`** — background timer syncs silently skip when
-   locked; also enforces an Emacs-side session timeout (because rbw's own
-   `lock_timeout` resets on every `rbw get` call from mbsync)
-2. **`mu4e`** — when the user opens mu4e (`C-c m`) and rbw is locked, show the
-   unlock popup instead of launching mu4e (which would trigger a sync and hang)
-3. **`mu4e-rbw-unlock`** — interactive command that pops a term buffer for
-   password entry; sentinel auto-kills the buffer and opens mu4e on success
+The solution uses two pieces: a predicate and an interactive unlock command,
+wired into mu4e via `:around` advice on both `mu4e` and
+`mu4e-update-mail-and-index`.
 
 **Pitfalls learned the hard way:**
 
@@ -405,12 +399,15 @@ The solution has three layers of `:around` advice:
 ```elisp
 ;; Emacs-side session tracking (rbw's own timer resets on every command)
 (defvar mu4e--rbw-unlock-time nil)
-(defconst mu4e--rbw-session-timeout (* 8 60 60))
 
-(defun mu4e--rbw-session-expired-p ()
-  (and mu4e--rbw-unlock-time
-       (> (float-time (time-subtract nil mu4e--rbw-unlock-time))
-          mu4e--rbw-session-timeout)))
+(defun mu4e--rbw-locked-p ()
+  "Return t if rbw is locked or the 8-hour session has expired."
+  (when (and mu4e--rbw-unlock-time
+             (> (float-time (time-subtract nil mu4e--rbw-unlock-time))
+                (* 8 60 60)))
+    (call-process "rbw" nil nil nil "lock")
+    (setq mu4e--rbw-unlock-time nil))
+  (not (zerop (call-process "rbw" nil nil nil "unlocked"))))
 
 ;; Interactive unlock — term buffer gives pinentry-tty a real TTY
 (defun mu4e-rbw-unlock ()
@@ -434,35 +431,27 @@ The solution has three layers of `:around` advice:
            (if (zerop (call-process "rbw" nil nil nil "unlocked"))
                (progn
                  (setq mu4e--rbw-unlock-time (current-time))
-                 (message "rbw unlocked — syncing mail...")
                  (mu4e))
-             (message "rbw unlock failed — mail sync skipped"))))))
+             (message "rbw unlock failed"))))))
     (display-buffer buf '((display-buffer-at-bottom) (window-height . 3)))
     (select-window (get-buffer-window buf t))
     (when (bound-and-true-p meow-mode) (meow-insert-mode))))
 
-;; Background syncs silently skip when locked or expired
-(defun mu4e--check-rbw-before-update (orig-fn &rest args)
-  (cond
-   ((mu4e--rbw-session-expired-p)
-    (call-process "rbw" nil nil nil "lock")
-    (setq mu4e--rbw-unlock-time nil)
-    (message "rbw session expired (8h) — run M-x mu4e-rbw-unlock to resume"))
-   ((not (zerop (call-process "rbw" nil nil nil "unlocked")))
-    (setq mu4e--rbw-unlock-time nil)
-    (message "rbw is locked — run M-x mu4e-rbw-unlock to resume"))
-   (t
-    (unless mu4e--rbw-unlock-time
-      (setq mu4e--rbw-unlock-time (current-time)))
-    (apply orig-fn args))))
-(advice-add 'mu4e-update-mail-and-index :around #'mu4e--check-rbw-before-update)
+;; Background syncs silently skip when locked
+(advice-add 'mu4e-update-mail-and-index :around
+  (lambda (orig-fn &rest args)
+    (if (mu4e--rbw-locked-p)
+        (message "rbw is locked — M-x mu4e-rbw-unlock to resume")
+      (unless mu4e--rbw-unlock-time
+        (setq mu4e--rbw-unlock-time (current-time)))
+      (apply orig-fn args))))
 
-;; Opening mu4e when locked → unlock first (don't launch mu4e, it would sync)
-(defun mu4e--check-rbw-on-launch (orig-fn &rest args)
-  (if (zerop (call-process "rbw" nil nil nil "unlocked"))
-      (apply orig-fn args)
-    (mu4e-rbw-unlock)))
-(advice-add 'mu4e :around #'mu4e--check-rbw-on-launch)
+;; Opening mu4e when locked → unlock first
+(advice-add 'mu4e :around
+  (lambda (orig-fn &rest args)
+    (if (mu4e--rbw-locked-p)
+        (mu4e-rbw-unlock)
+      (apply orig-fn args))))
 ```
 
 ### Sending email programmatically
@@ -652,6 +641,37 @@ adding or modifying application configuration, prefer creating a declarative
 
 - **`onChange`** — use for post-deploy fixups like permissions:
   `onChange = "chmod 600 $HOME/.msmtprc";`
+
+### Adding external flake inputs with overlays
+
+When a package comes from an external flake (not nixpkgs), add it as a flake
+input and expose it via an overlay so it's available as `pkgs.<name>` everywhere.
+
+**Step 1 — Add the flake input** in `flake.nix` under `inputs`:
+
+```nix
+my-tool.url = "github:owner/repo";
+```
+
+**Step 2 — Add an overlay** in `overlays/default.nix`:
+
+```nix
+my-tool =
+  final: _: {
+    my-tool = inputs.my-tool.packages.${final.stdenv.hostPlatform.system}.default;
+  };
+```
+
+This makes `pkgs.my-tool` available in NixOS modules, Home Manager, and
+anywhere else that receives `pkgs`. If the flake exposes its own overlay
+(like emacs-overlay does), prefer using that directly:
+
+```nix
+my-tool = inputs.my-tool.overlay;
+```
+
+After adding the overlay, the package can be used in `home.packages`,
+`environment.systemPackages`, or any other package list.
 
 ## Guard Rails
 

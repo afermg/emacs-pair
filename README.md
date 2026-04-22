@@ -52,3 +52,7 @@ Once the skill is active, Claude can:
 ## License
 
 MIT
+
+## Acknowledgements
+
+This project was inspired by [[https://github.com/marimo-team/marimo-pair][marimo-pair]]. I wondered
