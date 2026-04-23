@@ -710,6 +710,236 @@ matches both failures above.
 lazily. `add-to-list` is idempotent, so re-evaluating this form is safe.
 This is robust to both the missing autoload and the equality guard.
 
+## Working with mini-echo (echo-area modeline)
+
+[mini-echo](https://github.com/eki3z/mini-echo.el) renders the modeline in
+the echo area instead of per-window. Customising it has several traps
+worth knowing before you start editing `:config` blocks.
+
+### Rule order is reversed at render time
+
+`mini-echo-concat-segments` fetches each rule entry, filters empties, then
+calls `(reverse ...)` before joining. So **the first segment in the rule
+appears rightmost on screen**, not leftmost. A rule of
+`("time" "hostname" "buffer-name")` renders as `buffer-name hostname time`.
+Write the rule in reverse visual order; leave a comment stating this so
+the next reader doesn't flip it "to match".
+
+### `:both` collapses `:long`/`:short` duplication
+
+`mini-echo-normalize-rule` reads `:both` specially: if the rule plist
+contains `:both`, its value is used for both the long and short buckets.
+Use it whenever the two lists would be identical:
+```elisp
+(setq mini-echo-persistent-rule
+      '(:both ("flymake" "project" "hostname" "buffer-name"
+               "vcs" "buffer-position" "meow")))
+```
+
+### `mini-echo-persistent-detect` overrides the user rule
+
+For certain majors — magit-*-mode, `dired-mode`, `ibuffer-mode`,
+`diff-mode`, `helpful-mode`, `xwidget-webkit-mode`,
+`profiler-report-mode`, `rg-mode`, `org-src`, `atomic-chrome-edit-mode`,
+`magit-blob-mode`, popper-controlled buffers, `treesit--explorer-tree-mode`
+— `mini-echo-persistent-detect` returns a hard-coded `(:both (...))` rule
+that **completely bypasses** `mini-echo-persistent-rule`. If you want a
+segment visible everywhere (hostname, vcs, a state indicator), you have
+to inject it into that function's return:
+
+```elisp
+;; Keep hostname + vcs visible even in the hard-coded detections.
+(define-advice mini-echo-persistent-detect
+    (:filter-return (rule) afm/always-hostname+vcs)
+  (when rule
+    (let ((extra '("hostname" "vcs")))
+      (cl-loop for (key val) on rule by #'cddr
+               append (list key
+                            (append (seq-difference extra val) val))))))
+```
+
+Prepend vs append to `val` determines whether the extras end up on the
+right side of the rendered line (prepend — they become rightmost after
+the reverse) or the left (append).
+
+### Refresh caches after changing the rule at runtime
+
+`(setq mini-echo-persistent-rule …)` isn't enough — the merged rule is
+cached in `mini-echo--default-rule` (rebuilt by `mini-echo-ensure`) and
+memoised per-buffer in `mini-echo--selected-rule`. After editing the
+rule live, do all three:
+
+```elisp
+(dolist (buf (buffer-list))
+  (with-current-buffer buf
+    (kill-local-variable 'mini-echo--selected-rule)))
+(setq-default mini-echo--selected-rule nil)
+(mini-echo-ensure)
+(mini-echo-update-overlays)
+```
+
+Same treatment is needed when you define a new segment or flip the rule
+order — the new segments won't show up in any open buffer otherwise.
+
+### Segments that silently depend on another mode
+
+Two stock segments get you in trouble because their `:fetch` depends on
+state that another package toggles:
+
+- `remote-host` — only fires inside TRAMP buffers (tests
+  `(file-remote-p default-directory 'host)`), so on a local machine it
+  prints nothing. For "always show the local hostname," define your own:
+  ```elisp
+  (mini-echo-define-segment "hostname"
+    "Short hostname of the local machine."
+    :fetch (mini-echo-segment--print
+            (car (split-string (system-name) "\\."))
+            'mini-echo-remote-host))
+  ```
+- `time` — its `:setup` calls `(display-time-mode 1)` once, then the
+  `:fetch` reads `display-time-string`. If anything (stale config, old
+  hand-rolled modeline, toggling) disables `display-time-mode` again,
+  the segment goes blank and the `:setup` never re-runs (the segment's
+  `activate` slot is sticky). Use a self-contained version instead:
+  ```elisp
+  (mini-echo-define-segment "time"
+    "HH:MM — re-evaluated every `mini-echo-update-interval' (0.3s)."
+    :fetch (format-time-string "%H:%M"))
+  ```
+
+### Re-running a segment's `:setup`
+
+`mini-echo-define-segment` stores an `activate` flag on the segment
+struct; `:setup` runs exactly once per session. To force it again after
+changing something (e.g. flipping `display-time-mode` after the first
+activation):
+```elisp
+(when-let* ((seg (alist-get "time" mini-echo-segment-alist
+                            nil nil #'string=)))
+  (setf (slot-value seg 'activate) nil))
+```
+
+### Distinct colors per segment
+
+Two mechanisms, pick based on whether you own the segment:
+- **You redefined the segment**: pass the face as the second arg to
+  `mini-echo-segment--print`:
+  ```elisp
+  (mini-echo-define-segment "vcs"
+    :fetch (when (bound-and-true-p vc-mode)
+             (mini-echo-segment--print
+              (mini-echo-segment--extract vc-mode)
+              'font-lock-keyword-face
+              mini-echo-vcs-max-length)))
+  ```
+  (The stock `vcs` uses dynamic `vc-*-state` faces, which blend into the
+  rest of the modeline — pinning to a named face is the fix.)
+- **Stock segment, customise via its face**: remap `mini-echo-<name>` to
+  inherit from a theme face so it follows the palette:
+  ```elisp
+  (dolist (spec '((mini-echo-buffer-position . font-lock-variable-name-face)
+                  (mini-echo-major-mode      . font-lock-type-face)
+                  (mini-echo-buffer-size     . shadow)))
+    (set-face-attribute (car spec) nil
+                        :foreground 'unspecified
+                        :background 'unspecified
+                        :inherit (cdr spec))))
+  ```
+
+### Right-alignment and padding
+
+mini-echo right-aligns via `(space :align-to (- right-fringe padding))`
+where `padding = mini-echo-right-padding + content-length`.
+
+- Leave `mini-echo-right-padding` at ≥ 2. `0` clips the last character
+  on some frames (TTY + fringes in particular).
+- When content is wider than the minibuffer, the LEFT of the string is
+  clipped — so the leftmost segment in the reversed render disappears
+  first. Put the most-important segment last in the rule (rightmost on
+  screen) if you care about it being visible when overflowing.
+
+### Single-line echo area
+
+```elisp
+(setq resize-mini-windows 'grow-only     ; grow but don't freeze
+      max-mini-window-height 1)
+```
+
+Traps:
+
+- `resize-mini-windows nil` **freezes** the minibuffer at whatever
+  height it was when you set it. If it was already 2 lines from an
+  overflow, you're stuck there. Always `grow-only` (or `t`) and shrink
+  explicitly:
+  ```elisp
+  (let ((mw (minibuffer-window)))
+    (when (> (window-total-height mw) 1)
+      (window-resize mw (- 1 (window-total-height mw)) nil nil 'preserve)))
+  ```
+- Mini-echo's mode hiding (`mini-echo-hide-mode-line`) enables
+  `global-hide-mode-line-mode` and, on Emacs < 31, runs a 5-second
+  timer to force-apply `hide-mode-line-mode` to buffers that missed the
+  globalised hook. A brief flash of the native modeline at startup is
+  expected.
+
+### Background tint without losing text contrast
+
+The minibuffer's rendering face is `mini-echo-minibuffer-window`,
+applied via `(face-remap-add-relative 'default 'mini-echo-minibuffer-window)`.
+Setting `:inherit mode-line-inactive` on it tints the background
+nicely but **also** imports that face's dim grey foreground — mini-echo
+text then loses contrast against the echo area.
+
+You can't inherit only `:background` from one face: `:inherit` is
+all-or-nothing per unset attribute. Resolve the two sources explicitly,
+and rehook on theme change:
+```elisp
+(defun afm/mini-echo-refresh-minibuf-face ()
+  (set-face-attribute 'mini-echo-minibuffer-window nil
+                      :foreground (face-attribute 'default :foreground)
+                      :background (face-attribute 'mode-line-inactive :background)
+                      :inherit 'unspecified))
+(afm/mini-echo-refresh-minibuf-face)
+(add-hook 'enable-theme-functions
+          (lambda (_) (afm/mini-echo-refresh-minibuf-face)))
+```
+
+### Meow state as a single-char segment
+
+`meow--current-state` is the state symbol (`normal`, `insert`, `motion`,
+`keypad`, `beacon`). Map each to a letter with its own face so state is
+readable at a glance:
+
+```elisp
+(mini-echo-define-segment "meow"
+  "Single-character meow state indicator."
+  :fetch
+  (when (bound-and-true-p meow-mode)
+    (pcase (and (boundp 'meow--current-state) meow--current-state)
+      ('normal (mini-echo-segment--print "N" 'font-lock-builtin-face))
+      ('insert (mini-echo-segment--print "I" 'success))
+      ('motion (mini-echo-segment--print "M" 'font-lock-comment-face))
+      ('keypad (mini-echo-segment--print "K" 'error))
+      ('beacon (mini-echo-segment--print "B" 'mode-line-emphasis))
+      (_       (mini-echo-segment--print "?" 'shadow)))))
+```
+
+### Conditionally-visible segments
+
+A `:fetch` that returns `nil` is filtered out by
+`mini-echo-concat-segments` — no need for a predicate around the rule
+entry. Two useful examples:
+
+- Flymake only in prog-mode buffers: leave stock `"flymake"` in the rule;
+  `(when (bound-and-true-p flymake-mode) …)` in its fetch handles it.
+- Clock only in fullscreen frames:
+  ```elisp
+  (mini-echo-define-segment "time"
+    :fetch (when (memq (frame-parameter nil 'fullscreen)
+                       '(fullboth fullscreen maximized))
+             (format-time-string "%H:%M")))
+  ```
+
 ## Working with Org Files via Elisp
 
 When editing org files that Emacs has open, always go through the buffer:
