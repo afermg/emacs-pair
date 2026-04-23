@@ -493,6 +493,63 @@ bypass message-mode entirely and pipe through `msmtp`:
 
 This won't save to Sent — use it only for quick one-off sends where that's OK.
 
+### Diagnosing "send hangs forever"
+
+When mu4e send (or any msmtp call) hangs indefinitely, **verify the SMTP
+socket before chasing rbw, pinentry, emacs advice, or compose-buffer quirks**.
+Password retrieval is fast (a few ms via `rbw-agent` over a Unix socket), so a
+long hang almost always means msmtp is blocked on the network, not the
+credential path.
+
+**Fast check — `/dev/tcp` probe for the SMTP banner:**
+
+```bash
+# Expect: a "220 <host> ESMTP ..." line within a second or two
+timeout 10 bash -c 'exec 3<>/dev/tcp/<host>/<port>; head -1 <&3'
+```
+
+Possible outcomes:
+- **Banner arrives** → server is healthy; the hang is elsewhere (TLS, auth, emacs advice).
+- **TCP connects but no banner, then timeout** → a firewall or transparent
+  proxy is silently dropping the server → client data. msmtp is blocked on
+  `recvfrom` and will never recover. Switch to a different submission port
+  (try 465 / implicit TLS if you were on 587 / STARTTLS, or vice versa).
+- **TCP refused / no route** → routing or firewall at layer 3. Different
+  problem; `traceroute`, check VPN/network.
+
+**Telltale sign it's the network, not the server:** if *two independent
+providers* (e.g. mxroute and Gmail) both hang on the same port at the same
+time, it's the local network. Providers don't coordinate outages — identical
+symptoms = client-side.
+
+**strace confirms it unambiguously** if `/dev/tcp` is ambiguous:
+
+```bash
+timeout 10 strace -f -e trace=network -o /tmp/msmtp.trace \
+  sh -c 'printf "From: x\nTo: x\nSubject: x\n\n" | msmtp --read-envelope-from -t'
+tail -30 /tmp/msmtp.trace
+```
+
+Look for the pattern:
+```
+connect(..., sin_port=htons(587)) = 0              # TCP handshake succeeded
+recvfrom(..., 4096, 0, NULL, NULL) = ? ERESTARTSYS # blocked reading banner
+```
+That's a network blackhole on port 587. `rbw get …` succeeding earlier in the
+same trace rules out the credential path.
+
+**Switching to implicit TLS (port 465)** in `msmtprc`:
+```
+port 465
+tls_starttls off
+```
+(Leave `tls on` — implicit TLS still encrypts from the first byte; only the
+STARTTLS upgrade is turned off.)
+
+This failure mode tricks you into debugging rbw/pinentry/emacs because the
+password fetch happens *before* the SMTP hang, so "recent changes to the auth
+layer" become the first suspect. Always probe the socket first.
+
 ### Deleting / moving email programmatically
 
 `mu4e--server-move` requires a message docid (not a file path), which makes it
@@ -565,6 +622,93 @@ For evil-mode, use `evil-set-initial-state` instead:
 **Do not use hooks** like `(add-hook 'mu4e-view-mode-hook #'meow-insert-mode)`
 — `meow-global-mode` can override the state after the hook fires, making
 insert mode appear to not work.
+
+#### When state-list isn't enough: fully disable meow in a mode
+
+`meow-mode-state-list` only selects *which* state meow enters — it can't
+turn meow off. For modes where every state gets in the way (e.g. dired
+with `dired-subtree`'s TAB/S-TAB cycling, or heavy-TUI terminal modes
+where you want raw keyboard passthrough), advise the globalized turn-on
+function instead:
+
+```elisp
+(with-eval-after-load 'meow
+  (define-advice meow-global-mode-enable-in-buffer
+      (:around (orig-fn &rest args) afm/skip-dired)
+    (unless (derived-mode-p 'dired-mode)
+      (apply orig-fn args))))
+```
+
+Why advice and not a `dired-mode-hook` with `(meow-mode -1)`? `run-mode-hooks`
+fires the mode's own hook *before* `after-change-major-mode-hook`, and
+`meow-global-mode`'s enable-in-buffer runs from the latter — so the hook's
+disable gets silently undone a moment later. The advice is the only reliable
+interception point.
+
+After installing this kind of advice live, remember to toggle meow off in
+any already-open buffers of that mode — the advice only controls new
+buffers:
+
+```elisp
+(dolist (buf (buffer-list))
+  (with-current-buffer buf
+    (when (derived-mode-p 'dired-mode)
+      (meow-mode -1))))
+```
+
+## Working with Magit
+
+### Reinstating `m Magit` in `project-switch-project`
+
+Modern magit's wiring for `C-x p m` / the "Magit" entry in
+`project-switch-commands` lives in `magit-extras.el`, not magit's autoloads:
+
+```elisp
+;; In magit-extras.el — NO ;;;###autoload cookie above this form:
+(with-eval-after-load 'project
+  (when (and magit-bind-magit-project-status
+             (equal project-switch-commands
+                    (eval (car (get 'project-switch-commands 'standard-value)) t)))
+    (keymap-set project-prefix-map "m" #'magit-project-status)
+    (add-to-list 'project-switch-commands '(magit-project-status "Magit") t)))
+```
+
+Two traps stack here:
+
+1. **Not autoloaded** — the form only runs if something explicitly
+   `(require 'magit-extras)`. A bare `(use-package magit)` doesn't pull it
+   in, so the binding never registers.
+2. **Equality guard** — even if `magit-extras` loads, magit only injects
+   when `project-switch-commands` still equals its standard-value. Any prior
+   modification of the list (by another package, your own config, or even
+   an earlier evaluation during the same session) silently disables the
+   injection.
+
+**Diagnosis**:
+
+```elisp
+(list :prefix-m (lookup-key project-prefix-map "m")
+      :switch-cmds project-switch-commands
+      :magit-project-status (when (fboundp 'magit-project-status)
+                              (let ((fn (symbol-function 'magit-project-status)))
+                                (if (autoloadp fn) 'autoload 'loaded))))
+```
+
+If `:prefix-m` is nil but `:magit-project-status` is `autoload`, the
+autoload stub is registered but the wiring form never ran — symptom
+matches both failures above.
+
+**Fix** — wire it yourself from your own config, independent of magit-extras:
+
+```elisp
+(with-eval-after-load 'project
+  (keymap-set project-prefix-map "m" #'magit-project-status)
+  (add-to-list 'project-switch-commands '(magit-project-status "Magit") t))
+```
+
+`magit-project-status` is autoloaded, so calling it triggers magit load
+lazily. `add-to-list` is idempotent, so re-evaluating this form is safe.
+This is robust to both the missing autoload and the equality guard.
 
 ## Working with Org Files via Elisp
 
@@ -672,6 +816,36 @@ my-tool = inputs.my-tool.overlay;
 
 After adding the overlay, the package can be used in `home.packages`,
 `environment.systemPackages`, or any other package list.
+
+### Emacs settings that need Nix-aware workarounds
+
+Some Emacs interactions assume a writable `custom-file`. Under Nix, that
+file is either missing, read-only, or regenerated on rebuild, so anything
+that relies on persistence via `custom-set-variables` silently fails to
+stick — Emacs re-prompts on every launch.
+
+**Theme-trust prompt** is the most common case. `load-theme` asks
+"Loading a theme can run Lisp code — really load?" and, on confirmation,
+writes the theme's SHA to `custom-file` via `customize-push-and-save`.
+Under Nix that write either errors out or gets blown away on the next
+home-manager switch, so the prompt returns every session.
+
+Bypass the prompt explicitly rather than trying to persist the answer:
+
+```elisp
+(use-package modus-themes
+  :config
+  ;; Nix stores the config read-only, so `custom-file' can't persist the
+  ;; "trust this theme" answer. Trust up front instead of prompting.
+  (setq custom-safe-themes t)
+  (load-theme 'modus-vivendi-tritanopia :no-confirm))
+```
+
+Same pattern applies to any other setting that normally lives in
+`custom-file` (package-archive-priorities, TRAMP connection history, etc.)
+— surface them into your tracked init code with plain `setq`, or accept
+that they won't persist across rebuilds. The general rule: if Nix owns
+the dotfile, don't rely on Customize for anything.
 
 ## Guard Rails
 
