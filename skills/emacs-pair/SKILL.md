@@ -994,6 +994,23 @@ adding or modifying application configuration, prefer creating a declarative
    };
    ```
 
+3. **`mkOutOfStoreSymlink`** — for files the user edits frequently. Instead of
+   copying the content into the read-only Nix store (which forces a
+   `home-manager switch` after every edit), link the managed path back to the
+   repo working tree. Edits to the repo become live immediately:
+
+   ```nix
+   ".emacs.d/init.el" = {
+     source = config.lib.file.mkOutOfStoreSymlink
+       "${config.home.homeDirectory}/.local/share/src/nixos-config/modules/shared/config/emacs/init.el";
+   };
+   ```
+
+   Use this for editor configs, shell rc files, and anything else the user
+   iterates on. Reserve `builtins.readFile` for files that are effectively
+   frozen (lock templates, canned credentials). Tradeoff the user accepts:
+   the live config tracks the working tree, not the committed state.
+
 ### Key patterns
 
 - **Reference Nix packages for paths** — use `"${pkgs.pinentry-curses}/bin/pinentry-tty"`
@@ -1015,6 +1032,36 @@ adding or modifying application configuration, prefer creating a declarative
 
 - **`onChange`** — use for post-deploy fixups like permissions:
   `onChange = "chmod 600 $HOME/.msmtprc";`
+
+### Installing Emacs packages
+
+When the user's Emacs config is driven by a literate `config.org` that uses
+`use-package` + `straight.el`, install new Emacs packages inside `config.org`,
+**not** via the `emacs.pkgs.withPackages` list in `home.nix`.
+
+```org
+*** Startup profiler (esup)
+#+begin_src emacs-lisp
+  (use-package esup
+    :straight t
+    :commands (esup))
+#+end_src
+```
+
+Why prefer this over the Nix path:
+
+- The Emacs init (init.el / config.org) is typically symlinked via
+  `mkOutOfStoreSymlink`, so adding a package there takes effect on the next
+  Emacs eval — no `home-manager switch` required.
+- Routing packages through Nix forces a rebuild for each tweak and obscures
+  the relationship between the package and the config that configures it.
+- `straight.el` pins revisions in `straight/versions/default.el`, giving you
+  reproducibility without the Nix round-trip.
+
+Reserve the Nix `withPackages` list for the rare case where an Emacs package
+has a native dependency that `straight.el` cannot build (e.g., tree-sitter
+grammars shipped by a Nix overlay, or packages that wrap a non-Emacs binary
+that needs to be in `PATH`).
 
 ### Adding external flake inputs with overlays
 
