@@ -55,4 +55,6 @@ MIT
 
 ## Acknowledgements
 
-This project was inspired by [[https://github.com/marimo-team/marimo-pair][marimo-pair]]. I wondered
+This project was inspired by [marimo-pair](https://github.com/marimo-team/marimo-pair).
+
+See also: [efrit](https://github.com/steveyegge/efrit) by Steve Yegge, an earlier Emacs-native AI coding assistant that runs Claude inside Emacs itself rather than driving it from an external process.
