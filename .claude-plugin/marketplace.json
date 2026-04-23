@@ -1,0 +1,14 @@
+{
+  "name": "afermg-emacs-pair",
+  "owner": {
+    "name": "Alan F. Munoz"
+  },
+  "plugins": [
+    {
+      "name": "emacs-pair",
+      "source": "./",
+      "description": "Pair program with Claude inside a running Emacs session — read/write buffers, evaluate Elisp, run M-x commands, and inspect editor state",
+      "version": "1.0.0"
+    }
+  ]
+}
