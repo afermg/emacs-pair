@@ -2209,10 +2209,237 @@ trade-off is that *in-flight tool execution* doesn't survive —
 each resumed session gets a fresh PTY, the conversation continues
 from disk but any tool call that was running mid-crash is gone.
 
+## Working with `aio` / deferred packages (oauth2-auto, org-gcal)
+
+OAuth flows via `oauth2-auto` are full of traps that took a long
+session to map out. Most apply to any package built on `aio` /
+deferred / synchronous waits for network callbacks.
+
+### NEVER filter processes by `(eq (process-type p) 'network)`
+
+The Emacs server itself is a network process (Unix-domain socket).
+`(delete-process p)` on it kills the listener that accepts
+emacsclient connections — the daemon survives with all buffers
+intact, but you lose your only way to talk to it. The user has to
+manually `M-x server-start` in an interactive frame to recover.
+
+Filter precisely. To kill, e.g., only oauth2-auto's HTTP listener:
+
+```elisp
+(dolist (p (process-list))
+  (when (and (process-name p)
+             (string-prefix-p "oauth2-auto--httpd" (process-name p)))
+    (delete-process p)))
+```
+
+Or filter by contact shape — TCP listeners have `(host PORT)` where
+PORT is a number; Unix sockets have a path string. Skip anything
+whose contact is a path.
+
+### `aio-wait-for` blocks the main thread; emacsclient still works
+
+When org-gcal's sync calls `aio-wait-for (oauth2-auto-access-token …)`,
+the main loop sits in a busy-poll on `accept-process-output` until the
+promise resolves. The interactive frames *appear frozen* (no keyboard
+input processed) but `emacsclient --eval` calls still go through
+because filter functions on the server's network process get fired by
+`accept-process-output` itself. So you can diagnose / abort from
+outside even when the user can't type in their frame.
+
+Scheduling via `(run-at-time 0 nil #'foo)` does NOT escape this —
+when the timer fires, `foo` runs on the same main thread and blocks
+the same way. The only escapes are: aborting the wait, providing the
+input it's waiting for, or killing the listener it's waiting on
+(which raises an error and unwinds the chain).
+
+### Capturing `browse-url` calls — set globally, not let-bound
+
+To intercept a URL that the package would open in a browser (so you
+can show it to the user over chat):
+
+```elisp
+(setq browse-url-browser-function
+      (lambda (url &rest _)
+        (setq afm/captured-oauth-url url)
+        (with-temp-file "/tmp/captured-url.txt" (insert url))))
+```
+
+`let`-binding does NOT survive the aio yield. The package may call
+`browse-url` deep inside a deferred chain, by which point your
+`let` has gone out of scope. Use `setq` and restore later if needed.
+
+Also use `defvar` (not just `setq`) to declare your capture variable,
+because eval-elisp.sh runs each invocation in a fresh dynamic-binding
+context and `(setq afm/x ...)` followed later by `(or afm/x ...)` can
+trip "Symbol's value as variable is void" if you haven't `defvar`'d
+it once.
+
+### `read-string` blocks the requesting emacsclient
+
+The manual-auth flow (`oauth2-auto-manually-auth = t`) prints a URL
+and waits at `(read-string "Enter authorization code: ")`. If you
+fired the sync via `bash scripts/eval-elisp.sh`, your script hangs
+because emacsclient's request only returns after read-string does.
+The user CAN type into the minibuffer in their interactive frame —
+but if they don't notice it (focus is in a read-only buffer like an
+`eat` Claude terminal), they may swear nothing happened.
+
+**File-poller pattern** — let the user save the code to a file and a
+timer feeds it into the minibuffer:
+
+```elisp
+(defvar afm/code-file "/tmp/oauth-code")
+(defvar afm/poll-timer nil)
+(when afm/poll-timer (cancel-timer afm/poll-timer))
+(setq afm/poll-timer
+      (run-with-timer
+       2 2
+       (lambda ()
+         (when (and (file-exists-p afm/code-file)
+                    (active-minibuffer-window))
+           (let* ((raw (string-trim (with-temp-buffer
+                                      (insert-file-contents afm/code-file)
+                                      (buffer-string))))
+                  ;; Defensive: strip "code=" / leading "=" / full URL
+                  (code (cond
+                         ((string-match "code=\\([^&[:space:]]+\\)" raw)
+                          (match-string 1 raw))
+                         ((string-prefix-p "=" raw) (substring raw 1))
+                         (t raw))))
+             (delete-file afm/code-file)
+             (with-selected-window (active-minibuffer-window)
+               (delete-minibuffer-contents)
+               (insert code)
+               (exit-minibuffer)))))))
+```
+
+The user — or you, via Bash — writes the code to `/tmp/oauth-code`
+and the timer drops it into the prompt within 2s, no matter where
+the user's cursor is.
+
+### plstore + GPG for OAuth tokens on a gpg-less host
+
+`oauth2-auto` persists tokens via Emacs's `plstore`, which encrypts
+the secret section with GPG. Three settings have to line up or the
+write hangs/errors:
+
+1. `gnupg` package installed on the host (NixOS users on `age` may
+   not have it — add it explicitly).
+2. A GPG key for the user. For a daemon with no human present,
+   generate one non-interactively without a passphrase:
+   ```
+   gpg --batch --pinentry-mode loopback --passphrase '' \
+       --quick-generate-key "Emacs OAuth Tokens <you@example.com>" \
+       default default 0
+   ```
+3. From Emacs:
+   ```elisp
+   (setq epa-pinentry-mode 'loopback)              ; never prompt for a passphrase
+   (setq plstore-encrypt-to "you@example.com")     ; pin the recipient
+   ```
+
+Without `epa-pinentry-mode 'loopback`, `plstore-save` can hang
+indefinitely on a pinentry dialog that has nowhere to display.
+Without `plstore-encrypt-to`, plstore errors with
+`(epg-error "no usable configuration" OpenPGP)`.
+
+### Bypass when the package's own flow is too tangled
+
+`oauth2-auto--plstore-write` has a long-standing bug where the
+secret section ends up containing `t` placeholders instead of the
+real token strings (reproduced on org-gcal). Pattern when this
+happens: hand-roll the PKCE + token exchange and call `plstore-put`
+directly.
+
+```elisp
+;; 1. PKCE pair we control
+(let* ((charset "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+       (verifier (with-temp-buffer
+                   (dotimes (_ 64) (insert (elt charset (random (length charset)))))
+                   (buffer-string)))
+       (challenge (base64url-encode-string
+                   (secure-hash 'sha256 verifier nil nil t) t))
+       (state (with-temp-buffer
+                (dotimes (_ 12) (insert (elt charset (random (length charset)))))
+                (buffer-string))))
+  (setq afm/verifier verifier afm/state state)
+  ;; ... construct google oauth URL with challenge ...
+)
+
+;; 2. After user supplies the code, exchange directly
+(let* ((url-request-method "POST")
+       (url-request-extra-headers
+        '(("Content-Type" . "application/x-www-form-urlencoded")))
+       (url-request-data
+        (mapconcat (lambda (kv) (concat (url-hexify-string (car kv)) "="
+                                        (url-hexify-string (cdr kv))))
+                   `(("client_id"     . "...")
+                     ("client_secret" . "...")
+                     ("code"          . ,code)
+                     ("code_verifier" . ,afm/verifier)
+                     ("grant_type"    . "authorization_code")
+                     ("redirect_uri"  . "http://localhost:8080"))
+                   "&")))
+  (with-current-buffer (url-retrieve-synchronously
+                        "https://oauth2.googleapis.com/token" t t 30)
+    (goto-char (point-min)) (re-search-forward "\n\n")
+    (let* ((json-object-type 'plist) (json-key-type 'keyword)
+           (response (json-read)))
+      ;; 3. Write directly via plstore-put — NOT oauth2-auto--plstore-write
+      (let ((ps (plstore-open (expand-file-name "oauth2-auto.plist"
+                                                user-emacs-directory))))
+        (plstore-put ps "%28%22primary%22%20org-gcal%29%0A"
+                     nil  ; no public keys
+                     (list :access-token  (plist-get response :access_token)
+                           :refresh-token (plist-get response :refresh_token)
+                           :expiration    (+ (float-time)
+                                             (plist-get response :expires_in))))
+        (plstore-save ps) (plstore-close ps)))))
+```
+
+Note `url-retrieve-synchronously` blocks the main thread — fine for
+a one-off bootstrap call you initiate yourself; don't put it in a
+hot path.
+
+### Auth-code gotchas
+
+- **OAuth codes are single-use.** Each `org-gcal-sync` retry creates
+  a new flow with a new `state` and `code_verifier`. The user's
+  pasted code only matches the LATEST flow. If they retry-paste a
+  code from an earlier flow, exchange fails with `invalid_grant`.
+- **"Malformed auth code"** = the code arrived at Google with a
+  leading `=` or `code=` prefix (user copied the URL parameter
+  instead of just the value). The poller stripping above handles
+  this defensively.
+- **`Quit` during "Contacting host: oauth2.googleapis.com:443"**
+  aborts the token exchange and spends the code. Tell the user not
+  to `C-g` once they see that line.
+- **Multiple stacked sync flows.** Re-triggering sync before the
+  previous one finished leaves orphaned listeners and `t`-stub
+  plstore entries. Always `org-gcal--sync-unlock` and
+  `clrhash oauth2-auto--plstore-cache` before re-triggering.
+
+### Recovery commands
+
+```elisp
+(org-gcal--sync-unlock)               ; release sync mutex
+(clrhash oauth2-auto--plstore-cache)  ; clear in-memory token cache
+;; Wipe broken plstore file (forces re-decrypt or re-auth)
+(let ((f (expand-file-name "oauth2-auto.plist" user-emacs-directory)))
+  (when (file-exists-p f) (delete-file f)))
+;; Abort any pending minibuffer prompt
+(when (active-minibuffer-window) (ignore-errors (abort-recursive-edit)))
+```
+
 ## Guard Rails
 
 - **Never write to a file on disk while Emacs has it open** — use `insert`/`save-buffer` instead
 - **Avoid `kill-buffer` without asking** — it's destructive and loses unsaved changes
+- **Never `delete-process` by `process-type 'network` alone** — that includes the
+  Emacs server's Unix-socket listener. Filter by `process-name` prefix or by
+  contact shape (TCP listener has `(host PORT)` with numeric PORT; Unix sockets
+  have a path string). Killing the server kills your only way to talk to the
+  daemon; the user has to `M-x server-start` from an interactive frame to recover.
 - **Don't run blocking commands** like `read-string` or `yes-or-no-p` interactively —
   they'll hang `emacsclient`. Use non-interactive forms instead. When calling
   functions that might prompt, wrap with `cl-letf` to override `y-or-n-p` and
