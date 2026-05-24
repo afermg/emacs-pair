@@ -2378,7 +2378,11 @@ directly.
                      ("code"          . ,code)
                      ("code_verifier" . ,afm/verifier)
                      ("grant_type"    . "authorization_code")
-                     ("redirect_uri"  . "http://localhost:8080"))
+                     ;; Default oauth2-auto manual-flow port is 8080, which
+                     ;; collides with common local services (nginx). Pick a
+                     ;; high port and use the SAME value as the redirect_uri
+                     ;; you registered when constructing the auth URL.
+                     ("redirect_uri"  . "http://localhost:28080"))
                    "&")))
   (with-current-buffer (url-retrieve-synchronously
                         "https://oauth2.googleapis.com/token" t t 30)
