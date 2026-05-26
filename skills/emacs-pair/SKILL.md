@@ -454,6 +454,49 @@ wired into mu4e via `:around` advice on both `mu4e` and
       (apply orig-fn args))))
 ```
 
+### Picking the right context before sending
+
+**Lesson learned the hard way:** for a *fresh* compose (no parent message),
+`mu4e-compose-mail` does not infer context from the recipients — it just
+uses whichever context happens to be current. With the default
+`mu4e-context-policy = pick-first`, that's whichever context is first in
+`mu4e-contexts`, even when the user has a long thread history with those
+recipients from a *different* account.
+
+Result: the agent silently sends from the wrong From address. The user
+typically does not notice until they check Sent, by which point the
+recipients have already received a message that looks like it came from
+the wrong account.
+
+**Mandatory check before any programmatic send to a known correspondent:
+look up which of the user's own addresses they have historically used
+with those recipients, and switch context to match.** Treat the current
+context as untrusted — do not assume the default is right.
+
+Look up history with `mu` (its index is in sync with mu4e):
+
+```bash
+# Most recent outbound to <recipient> — the From field shows which of
+# the user's own addresses they used. Run this for each recipient.
+mu find "to:<recipient-address>" --fields "d,f,s" \
+  --sortfield=date --reverse | head
+```
+
+If the prior thread used a different From than the current context,
+switch before composing:
+
+```elisp
+;; Switch deterministically by context name. nil arg suppresses the prompt.
+(mu4e-context-switch nil "<context-name>")
+(mu4e-context-name (mu4e-context-current))    ;; verify
+;; Then call (mu4e-compose-mail ...)
+```
+
+After the compose buffer exists, sanity-check the From header still
+matches the expected context before sending. If it doesn't, abort
+rather than send — letting the user fix the context manually is cheap;
+an out-of-band send isn't recoverable.
+
 ### Sending email programmatically
 
 Use `mu4e-compose-mail` to create compose buffers — it properly sets up Fcc
@@ -466,6 +509,10 @@ Suppress them with `cl-letf`:
 ```elisp
 ;; Preferred: uses mu4e-compose-mail for full mu4e integration (Fcc, sent folder)
 (progn
+  ;; CRITICAL: pick the context that matches the thread before composing.
+  ;; See "Picking the right context before sending" above — look up prior
+  ;; outbound to the recipient with `mu find to:...` first.
+  (mu4e-context-switch nil "<context-name>")
   (mu4e-compose-mail "recipient@example.com" "Subject line")
   (let ((buf (car (seq-filter (lambda (b)
                                 (with-current-buffer b
