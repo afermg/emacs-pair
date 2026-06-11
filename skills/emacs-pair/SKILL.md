@@ -361,6 +361,25 @@ context from the maildir when reading, and prompts when composing:
 For Gmail accounts: IMAP folder names are `[Gmail]/Sent Mail`, `[Gmail]/Drafts`,
 `[Gmail]/Trash`. Requires an App Password (https://myaccount.google.com/apppasswords).
 
+### Account: alan@quasimorphic.com on mxroute
+
+The user's primary mail account `alan@quasimorphic.com` is hosted at
+mxroute (`witcher.mxrouting.net`, IMAPS 993, IMAP password stored in rbw
+as `'Quasimorphic Email'`). **Mailbox quota is 15 GB.**
+
+Relevance to backups and bulk operations:
+
+- A full Broad-Gmail archive on this account (~3.3 GB deduplicated, ~5 GB
+  raw across all labels) fits comfortably with room to spare.
+- Multi-account consolidation (Broad + personal Gmail + tutanota) is
+  feasible within the same quota.
+- Use IMAP `GETQUOTA` against the account before any bulk APPEND to
+  confirm headroom — quota can be reduced by mxroute over time, and
+  pre-existing folders may already occupy more than expected.
+- mxroute supports server-side sieve via Roundcube → Settings → Filters
+  (and ManageSieve), so per-`+tag` routing rules can be installed without
+  touching local config.
+
 ### Credential management with rbw (Bitwarden)
 
 mbsync and msmtp both support external password commands. Use `rbw` (unofficial
