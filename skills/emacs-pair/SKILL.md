@@ -707,6 +707,46 @@ email address string):
          mu4e--contacts-set)
 ```
 
+### `mu view` hides HTML-only bodies by default
+
+`mu view <path>` defaults to `--format=plain`. For HTML-only emails (no
+`text/plain` alternative) it prints `[No plain text body found]` and lists
+attachment names — *but never shows the HTML*. Many transactional emails
+fall into this trap: Amtrak eTickets, order confirmations, marketing
+templates from Mailchimp/SendGrid/etc. The plain-text-alternative is
+often dropped by the platform, so the entire body becomes invisible to
+`mu view`'s default rendering.
+
+Symptom: you're searching for a price / order ID / per-line breakdown,
+`mu view` says "[No plain text body found]" with one attachment, you open
+the attachment and the field isn't there either. Easy to conclude "this
+email doesn't contain the data" and move on — when actually the HTML body
+has it and `mu view` just isn't showing you.
+
+Fixes:
+
+```bash
+# Dump the HTML body
+mu view --format=html /path/to/maildir/file
+
+# Enumerate every MIME part (so you can see exactly what's in the message)
+mu extract --parts /path/to/maildir/file
+
+# Save every part to disk and inspect
+mu extract --save-parts --target-dir=/tmp/parts /path/to/maildir/file
+```
+
+The maildir file is also just an RFC 822 message — plain `grep` /
+`awk` against the raw bytes works when you only need to confirm
+presence of a string. For programmatic scans from Elisp, jump past
+the headers with `re-search-forward "Content-Type: text/html"` then
+scan the body region for the pattern you want.
+
+Generalisation: whenever a `mu view` summary contradicts what the user
+remembers seeing in the email, re-view with `--format=html` before
+concluding the data isn't there. The default plain-text view is a
+display setting, not a truth claim about the message.
+
 ### Mode compatibility with modal editors (meow, evil)
 
 Buffers like mu4e, magit, and other special-mode packages use their own
