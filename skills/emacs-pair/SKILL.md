@@ -9,7 +9,7 @@ description: >-
   any Emacs subsystem accessible through Elisp. Use this whenever the user
   mentions Emacs buffers, elfeed feeds, mu4e mail, org files open in Emacs,
   or wants to evaluate Elisp.
-allowed-tools: Bash(bash **/scripts/discover-servers.sh *), Bash(bash **/scripts/eval-elisp.sh *)
+allowed-tools: Bash(bash **/scripts/discover-servers.sh *), Bash(bash **/scripts/eval-elisp.sh *), Bash(bash **/scripts/browse-url.sh *)
 ---
 
 # Emacs Pair Programming Protocol
@@ -79,6 +79,47 @@ bash scripts/eval-elisp.sh --server /run/user/1000/emacs/myserver -e "(+ 1 2)"
 
 `emacsclient --eval` returns the Lisp read-syntax of the return value.
 Strings come back quoted: `"hello"`. `nil` means no value or false. `t` means true.
+
+## Cross-host: Driving another machine's Emacs over ssh
+
+Pass `--host HOST` to `eval-elisp.sh` to evaluate the Elisp against an
+Emacs server on a different machine. The script will route the call
+through `ssh HOST bash`, base64-encoding the Elisp so arbitrary quoting
+(strings with `"`, `\`, `$`, backticks) survives both shells unchanged.
+The remote `emacsclient` uses its default socket unless `--server` is
+also passed (in which case the socket path/name is honored on the remote).
+
+```bash
+# Run on a headless server; ask workstation's Emacs to do something:
+bash scripts/eval-elisp.sh --host workstation -e '(emacs-version)'
+
+# Same, but target a named server on the remote:
+bash scripts/eval-elisp.sh --host workstation --server work -e '(buffer-list)'
+```
+
+Prerequisites for the remote host:
+- `ssh HOST` works non-interactively (key auth, no password prompt).
+- An Emacs server is running on HOST (`M-x server-start`).
+- `bash` and `base64` are available on HOST (standard on any Linux/macOS).
+  The remote's login shell can be anything (fish, zsh, …) — the script
+  invokes `ssh HOST bash` explicitly.
+
+### Opening a URL in a remote browser
+
+The most common cross-host use is asking a GUI machine to open a URL
+when the local machine is headless (e.g. when copy-paste between SSH
+session and laptop browser is awkward). Use the `browse-url.sh` helper:
+
+```bash
+bash scripts/browse-url.sh --host workstation 'https://example.com/long?url=with&special=chars'
+```
+
+This wraps `(browse-url "...")` with proper Elisp string escaping for
+`"` and `\` in the URL. The Emacs `browse-url` function is what M-x
+`browse-url` calls — it respects the user's `browse-url-browser-function`
+setting on the remote.
+
+`browse-url` returns `nil` on success; that is the expected output.
 
 ## Common Operations
 
