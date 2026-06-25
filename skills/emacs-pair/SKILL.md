@@ -285,6 +285,92 @@ Common causes:
 - **`No buffer named "..."`** — buffer not open; use `find-file` or `get-buffer-create`
 - **Server not responding** — run `discover-servers.sh` to confirm the socket is live
 
+## Stale emacsclient processes block the server
+
+Symptom: "Emacs only responds via the GUI; `emacsclient` hangs." New
+`emacsclient --create-frame` / `emacsclient -t` invocations sit forever;
+short evals may or may not return depending on what kind of client is
+holding the server. Meanwhile the GUI frame the user already has open is
+fully responsive, because keystrokes bypass the server's client-handling
+code and go straight to the running Emacs process.
+
+Cause: `emacsclient` calls that open a frame (`-c` / `-t` /
+`--create-frame`) enter a `recursive-edit` on the server and stay there
+until the frame is deleted (`C-x 5 0`). `emacsclient --eval` calls
+normally return immediately, but they can wedge if the form they
+evaluate blocks (e.g. `find-file` on a PDF that triggers an interactive
+prompt no one is at the keyboard to answer, or a `recursive-edit` the
+caller forgot about). Either way, the stale client occupies a server
+slot and may leave Emacs at `recursion-depth > 0`, which makes
+subsequent client behavior look "stuck."
+
+This is especially common when a previous Claude session left an
+emacs-pair eval blocked — the parent shell exited but the
+`emacsclient --eval` and its `eval-elisp.sh` wrapper are still in `S`
+state waiting on a response that will never come.
+
+**Diagnosis:**
+
+```bash
+# Find every emacsclient that's still hanging around, and how old each is.
+ps -o pid,etime,stat,cmd -C emacsclient
+
+# Cross-check from inside Emacs.
+bash scripts/eval-elisp.sh -e '(list :pid (emacs-pid)
+                                     :recursion (recursion-depth)
+                                     :clients (length server-clients)
+                                     :frames (length (frame-list)))'
+```
+
+What the numbers mean:
+- `:recursion 0` with no active minibuffer → server is idle, no stuck
+  clients holding a `recursive-edit`.
+- `:recursion ≥ 1` with `(minibuffer-prompt)` non-nil → Emacs is
+  literally waiting for `y-or-n-p` input; answer it in the GUI or call
+  `(abort-recursive-edit)` via `emacsclient --eval`.
+- `:recursion ≥ 1` with `(minibuffer-prompt)` nil → a frame-creating
+  client (`-c`/`-t`/`--create-frame`) is holding the recursive edit.
+  This is normal *while* the user wants that frame; it only becomes a
+  problem when the client is stale.
+- `:clients` higher than the number of frames the user is actually
+  using → there are zombie clients to clean up.
+
+**Fix — kill the stale clients from the shell:**
+
+```bash
+# Kill specific stuck clients (and their eval-elisp.sh wrappers if you
+# want to clean those up too — the server will release the socket
+# either way).
+kill <pid>...
+```
+
+The server detects the broken socket and releases the slot. The GUI
+Emacs process is unaffected. Don't kill the Emacs process itself
+(`emacs` / the parent of the `server` socket) — that loses all unsaved
+state.
+
+After cleanup, re-run the probe; `:recursion` should be 0 and
+`:clients` should drop to just the eval you're currently running (≈ 1).
+
+**Telltale signs it's this and not a real server hang:**
+- `pgrep -af emacsclient` shows processes with `etime` of hours or days
+  (e.g. `1-20:39:31` = a day and twenty hours old).
+- One of them is an `--eval` whose form quotes a `find-file` on a PDF,
+  org file with prompts, or any other call that can enter a recursive
+  edit — that's the original culprit.
+- A `--create-frame` / `-t` client with a long `etime` is the user's
+  long-forgotten "open a frame" that they never closed via `C-x 5 0`.
+
+**Prevention:**
+- Don't `find-file` files that trigger interactive prompts (large
+  files, PDFs without pdf-tools auto-config, encrypted org files) from
+  an eval. Wrap with `cl-letf` overrides for `y-or-n-p` /
+  `yes-or-no-p` when calling functions that might prompt — same pattern
+  as the mu4e compose example earlier in this skill.
+- For one-shot file reads, prefer `find-file-noselect` and read
+  `buffer-string` directly, then `kill-buffer` — that path doesn't
+  trigger mode hooks that prompt.
+
 ## Batch Edits via Elisp Files
 
 For large operations (many line edits, bulk refiling), generate a `.el` file and
