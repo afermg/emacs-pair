@@ -728,6 +728,108 @@ bypass message-mode entirely and pipe through `msmtp`:
 
 This won't save to Sent — use it only for quick one-off sends where that's OK.
 
+### Recovering from corrupted mu4e state — do NOT use `unload-feature`
+
+If mu4e starts emitting `Symbol's function definition is void: nil` on
+every server response (filter dispatch is broken — see the parallel-send
+section above), **do not try to recover with `unload-feature` on
+`mu4e` or its submodules.** It looks like a clean reload but it's
+strictly worse than the original state:
+
+- `unload-feature` un-binds the `defvar`-defined variables from those
+  files. After it runs, `mu4e--server-handler-buf` and other internal
+  state vars go from "bound but nil" (recoverable) to "not even bound"
+  (you can't even read them without `Symbol's value as variable is void`).
+- A subsequent `(require 'mu4e)` only re-defines variables whose
+  `defvar` body runs unconditionally; many internal vars are
+  defined in a `let` or as side effects of init forms that only fire
+  on the public `(mu4e)` entry. So the package comes back
+  half-rebuilt and `mu4e--start` won't bring it to a usable state.
+- Even worse: it can scramble buffer-local hook installations the
+  user's config relies on (e.g. their meow-state advice from
+  "Mode compatibility with modal editors"), so recovery touches
+  unrelated subsystems.
+
+**What to do instead, in order of escalation:**
+
+1. *Stop the bleeding.* Cancel mu4e timers, override the filter to
+   `#'ignore`, then `delete-process` the server. That stops the error
+   spew without modifying any vars:
+   ```elisp
+   (when (boundp 'mu4e--update-timer)
+     (when mu4e--update-timer (cancel-timer mu4e--update-timer)))
+   (dolist (timer (append timer-list timer-idle-list))
+     (when (and (timerp timer)
+                (symbolp (timer--function timer))
+                (string-match-p "mu4e" (symbol-name (timer--function timer))))
+       (cancel-timer timer)))
+   (when (and (boundp 'mu4e--server-process)
+              (process-live-p mu4e--server-process))
+     (set-process-filter mu4e--server-process #'ignore)
+     (set-process-sentinel mu4e--server-process #'ignore)
+     (delete-process mu4e--server-process))
+   (setq mu4e--server-process nil)
+   ```
+
+2. *Try a clean restart.* `(mu4e t)` (not `mu4e--start`). If the
+   handler-buf re-initialises and a `mu4e-search` round-trips without
+   errors, you're back.
+
+3. *If that doesn't work, ask the user to restart the Emacs daemon.*
+   This is the **only** in-session recovery that's guaranteed clean.
+   `systemctl --user restart emacs` (or whichever supervisor). Yes,
+   the user loses buffer state — but that's strictly better than
+   continuing to poke at a corrupted package that's leaking errors
+   into every operation.
+
+**Do not** try `unload-feature` + `require`. **Do not** try
+`(mapatoms (lambda (s) ... (makunbound s)))` over mu4e symbols.
+**Do not** try editing the byte-compiled .elc files. Each of those
+makes the corrupted state worse, not better, and means the eventual
+Emacs restart can't be avoided anyway.
+
+### Capturing the Message-ID of an outbound email
+
+**Capture the Message-ID *after* the send completes, not from the draft buffer
+before send.** `message-send-and-exit` (and `message-send`) regenerate the
+`Message-ID:` header at send time. The compose buffer's draft Message-ID is
+overwritten in transit, so any link or note recorded from the pre-send buffer
+points at a msgid that never reaches any mbox.
+
+Capture from the Sent maildir instead:
+
+```elisp
+;; Right after message-send-and-exit:
+(let ((sent-dir (expand-file-name "~/.mail/<account>/Sent/cur"))
+      (target-recipient "user@example.com"))
+  ;; Newest file in the Sent folder is usually the one we just sent.
+  ;; Confirm by recipient or subject before trusting it.
+  (let* ((files (sort (directory-files sent-dir t "^[^.]")
+                      (lambda (a b)
+                        (time-less-p (nth 5 (file-attributes b))
+                                     (nth 5 (file-attributes a))))))
+         (latest (car files)))
+    (with-temp-buffer
+      (insert-file-contents latest nil 0 4000)
+      (when (and (re-search-forward
+                  (format "^To: .*%s" (regexp-quote target-recipient)) nil t)
+                 (goto-char (point-min))
+                 (re-search-forward "^Message-ID: <\\([^>]+\\)>" nil t))
+        (match-string 1)))))
+```
+
+Diagnostic: if a link recorded right after a programmatic send fails to
+resolve (`mu find msgid:... → no matches`), this is almost always the cause —
+the draft msgid was captured. The fix is to re-read the Sent maildir and
+update the link to the actual sent Message-ID. Two side-effects worth noting:
+
+- A single inquiry can produce *two* sends if the user also clicks send
+  manually after the agent drafts the buffer (the agent's send fires
+  separately on the buffer it created). The Sent folder gets both messages;
+  pick the one whose recipients + subject match the inquiry.
+- The Sent folder uses mbsync filenames (e.g. `1781287394.xxx`), not the
+  original Message-ID. Don't try to construct the path from Message-ID.
+
 ### Replying to a specific message (wide-reply) by message-id
 
 To compose a reply-all to an existing message from headless `emacsclient` — for
