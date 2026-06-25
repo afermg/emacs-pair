@@ -371,6 +371,203 @@ After cleanup, re-run the probe; `:recursion` should be 0 and
   `buffer-string` directly, then `kill-buffer` — that path doesn't
   trigger mode hooks that prompt.
 
+## Emacs daemon restart loop: orphan FDs hold the listen socket
+
+A specific failure mode that looks like "everything died" from the
+user's perspective, and like a restart loop in the journal, but is
+actually a two-Emacs-coexistence problem with a 30-minute fuse.
+
+### Symptom
+
+User reports: "things died — my eat buffers (claude / mu4e / repl /
+whatever's PTY-rooted in Emacs) are all gone." When you check:
+
+- `systemctl --user status emacs` shows the unit active, recently
+  started — `1 min 43s ago` style, not hours.
+- `emacs-pid` from inside the daemon corresponds to a process whose
+  parent is the user's systemd manager.
+- The dashboard / package's in-memory state (live instance set, eat
+  buffers, mu4e contexts, whatever was loaded) is empty — only what
+  the post-restart init has rehydrated from disk.
+
+That alone could be a clean crash + restart. The tell that it's the
+orphan-FD pattern is the journal:
+
+```
+emacs.service: Scheduled restart job, restart counter is at 528.
+```
+
+A counter in the hundreds, with the corresponding log lines all
+saying `Another instance of Emacs is running the server, either as
+daemon or interactively.` and each cycle exiting with `status=1`.
+
+### What's actually happening
+
+1. Emacs daemon A (could be systemd-launched, could be a manual
+   `emacs --bg-daemon`, could be a prior generation that lingered)
+   has been running, owns the listen socket
+   (`/run/user/<uid>/emacs/server`), and is the daemon all the live
+   eat buffers / claude TUIs / mu4e processes are children of.
+2. Emacs daemon A *crashes* — typically SIGABRT from inside a third-
+   party package. (claude-dashboard's usage monitor has done this in
+   practice; the coredump's `Module ...-eln without build-id` lines
+   call out which `.eln` is on the stack at the time of abort.)
+3. Daemon A's children — every claude eat subprocess, every mbsync,
+   every `make-process` child — inherited Emacs's listen-socket FD
+   via `fork()`. They didn't `close()` it (no `FD_CLOEXEC` on the
+   listener historically — fixed upstream eventually, not always
+   backported), so when A dies, those orphans **keep the kernel
+   socket alive**. The path on disk is gone, but `connect()` to it
+   succeeds because the listening FD is still open in the children.
+4. systemd's `Restart=on-failure` kicks in. A fresh Emacs B starts,
+   loads init, gets to `server-start`, calls `server-running-p`,
+   which connects to the socket path, the orphan FD accepts the
+   connection (and does nothing with it), so B sees "another
+   instance" and exits status 1.
+5. systemd restarts again. And again. With `RestartUSec=100ms` +
+   ~3 s of init time per attempt, it's ~3 s per cycle. The default
+   `StartLimitBurst=5` in `StartLimitIntervalSec=10s` never trips
+   because the attempt rate stays under the burst limit (each cycle
+   spans 3 s, well past the burst window).
+6. Eventually the orphans die (they hit their own EOF on PTY reads,
+   or the user reaps them, or one of them crashes too — claude TUIs
+   have been observed to abort with SIGABRT in this state). The
+   kernel socket finally closes. The next systemd restart succeeds.
+
+The journal pattern that confirms this:
+
+```bash
+journalctl --user -u emacs --since "2 hours ago" --no-pager \
+  | grep -E "Started Emacs|Another instance|restart counter is at (1|10|50|100|500)\b"
+```
+
+A clean restart cycle bookend looks like:
+
+```
+14:43:19  restart counter is at 1.      ← loop starts (first failure)
+14:43:50  restart counter is at 10.
+14:55:48  restart counter is at 200.
+15:13:51  restart counter is at 500.
+15:15:35  Started Emacs text editor.    ← orphans finally gone
+```
+
+Total: 32 min, 528 attempts, all because a third-party `.eln`
+crashed Emacs once.
+
+### Forensic confirmation
+
+If the user's `systemd-coredump` is wired up (NixOS default), the
+crash that started the loop has a dump:
+
+```bash
+coredumpctl list --since "2 hours ago"
+# look for SIGABRT on /nix/store/.../emacs, then:
+coredumpctl info <PID>
+```
+
+`coredumpctl info` prints the module list — packages whose `.eln`
+files are on the stack at abort time. That's your suspect. The
+loop-ender (second crash) often appears in the dump list too, with
+a *lower* PID than the loop-starter — that PID was actually older,
+holding the socket throughout, and only died at the end.
+
+Two PIDs in `coredumpctl` close in time, both `emacs`, one
+substantially older than the other, is the giveaway that two Emacs
+daemons were coexisting before the loop started.
+
+### What `Another instance of Emacs is running` actually means here
+
+It doesn't always mean a full Emacs process is alive — it means
+`server-running-p` returned non-nil, which only requires that
+`connect()` to the socket path succeeds. An orphan child holding
+the listen FD satisfies that condition even though the original
+Emacs is gone.
+
+So the message is technically correct ("a server is listening") but
+deeply misleading — there's no Emacs you can connect to, just a
+socket the kernel still has open. `emacsclient` to that socket also
+"succeeds" at the TCP level but then hangs because no one reads the
+request.
+
+### Diagnosis checklist
+
+When you walk into "things died, fix it":
+
+```bash
+# 1. How many Emacs processes are alive RIGHT NOW?
+ps -eo pid,ppid,etime,cmd | awk '/[e]macs/'
+#    Look for: more than one with cmd matching /emacs.*--fg-daemon|--bg-daemon/.
+#    Multiple = the rival is still here. Single = the rival is already gone.
+
+# 2. Is the systemd unit in a restart loop?
+systemctl --user status emacs
+journalctl --user -u emacs --since "30 min ago" \
+  | grep "restart counter" | tail -5
+#    Counter > 5 = loop happening or recently happened.
+
+# 3. Is the unit's emacs the one currently holding the socket?
+ss -lxp 2>/dev/null | grep emacs/server
+ls -la /run/user/$UID/emacs/server
+#    Owner UID + socket mtime should match the systemd Emacs's start
+#    time. If mtime is much older than the systemd Emacs's start
+#    time, the socket is held by an orphan.
+
+# 4. Did the loop already resolve?
+journalctl --user -u emacs --since "1 hour ago" \
+  | grep -E "Started Emacs|Main process exited" | tail -10
+#    A "Started Emacs" after a long stretch of "exited code=exited
+#    status=1/FAILURE" means the orphans finally died.
+
+# 5. What package crashed Emacs originally?
+coredumpctl list --since "2 hours ago"
+coredumpctl info <PID-of-first-emacs-dump> | head -50
+#    Look at the Module list — the third-party .eln names.
+```
+
+### What NOT to do
+
+- **Don't restart the unit manually mid-loop** (`systemctl --user
+  restart emacs`). The new attempt just enters the same loop. You
+  have to wait for the orphans, or kill them.
+- **Don't `rm /run/user/$UID/emacs/server`** during a loop unless
+  you're prepared to kill the orphans too. Removing the path lets a
+  new Emacs bind, but the orphans still have the inode FD open and
+  some clients (notably `emacsclient` that connected just before
+  the unlink) may still route to them.
+- **Don't `kill -9` the rival Emacs** if you have unsaved buffers.
+  Even when the rival is wedged, `kill -TERM` lets it run
+  `kill-emacs-hook` and save buffers. SIGKILL throws those away.
+
+### Resolution paths
+
+In order of escalation:
+
+1. **Wait it out.** If the loop has been running < 30 min, the
+   orphans almost certainly die on their own (claude TUIs in
+   particular abort after enough time). Document the state for the
+   user but don't intervene.
+2. **Kill the rival cleanly** if you've identified it via `ps`:
+   `kill -TERM <rival-PID>`. Confirm with `pgrep -af emacs`. The
+   loop should resolve within one restart cycle.
+3. **Reap the orphan claude / TUI children** that are holding the
+   FD. `pgrep -af claude-unwrapped` after the rival's gone — any
+   survivor here is the actual holder. `kill -TERM` each, watch
+   the journal, the next restart should succeed.
+4. **Only if the above fail**: look at the unit's
+   `StartLimitBurst` / `RestartUSec` / `ExecStartPre` and tune them
+   so future loops fail fast. Default config genuinely doesn't
+   protect against this — 528 retries with no human-visible
+   warning is the expected behaviour, not a misconfiguration.
+
+### Recovering the lost sessions afterward
+
+The eat buffers from the dead Emacs are gone, but each claude /
+mu4e / repl session that was running has on-disk state. Use the
+"Reloading older claude sessions that died" section below to
+identify and resume them. Cluster of `~/.claude/projects/.../*.jsonl`
+files with the same mtime = the moment Emacs died = the resume
+candidate set.
+
 ## Batch Edits via Elisp Files
 
 For large operations (many line edits, bulk refiling), generate a `.el` file and
@@ -2291,6 +2488,148 @@ path. The test asserts:
 
 (2) is the one that catches the split-write regression specifically;
 (1) and (3) catch other failure modes.
+
+### Reloading older claude sessions that died
+
+When the user asks to "restart the sessions we had open" after an
+Emacs crash / restart / OOM kill, two facts shape the recovery flow:
+
+1. **The manifest is not a history.** `claude-dashboard-manifest-file`
+   (`~/.claude/dashboard-manifest.el` by default) is rewritten on every
+   instance event with the *currently-live* set, not an audit log. So
+   when the daemon comes back up with a smaller live set, the manifest
+   shrinks to match. `claude-dashboard-resume-all` reads this manifest
+   — it will not bring back sessions that died before the most recent
+   manifest write, even though their on-disk transcripts still exist
+   and are perfectly resumable.
+2. **The transcripts are the source of truth.** Every prior session
+   leaves a `~/.claude/projects/<encoded-cwd>/<sid>.jsonl` behind. Find
+   the recently-dead ones by mtime — and look for a cluster of files
+   sharing one timestamp, which means they all went down together
+   (Emacs crash, host reboot, supervisor restart):
+   ```bash
+   find ~/.claude/projects -name "*.jsonl" -printf "%T@ %p\n" \
+     | sort -rn | head -30
+   ```
+
+#### Identifying each candidate before relaunching
+
+Don't relaunch blind. For each transcript pick out the same metadata
+the dashboard would display:
+
+- **Name** — last `customTitle` event (bottom-up; later renames win):
+  ```bash
+  tac "$f" | grep -m1 customTitle
+  ```
+- **cwd** — read it from the transcript's own JSON, *not* by decoding
+  the directory name. The encoded path replaces `_` with `-` so
+  `emacs_llm_dashboard` ends up under
+  `~/.claude/projects/-home-amunoz-projects-emacs-llm-dashboard/`, and
+  passing that decoded back as the launch CWD silently lands in the
+  wrong (or nonexistent) directory:
+  ```bash
+  grep -m1 -oE '"cwd":"[^"]+"' "$f"
+  ```
+- **Most recent user message** — gives you the "where did we leave
+  off" context:
+  ```bash
+  tac "$f" | grep -m1 '"type":"user"'
+  ```
+  Watch for explicit park instructions there ("don't do anything",
+  "I'll use the other instance"). Those sessions usually shouldn't
+  be resumed automatically — confirm with the user.
+- **Overlap with live sessions** — multiple sessions can coexist in
+  the same cwd; the dashboard disambiguates them by sid suffix
+  (`*claude-nix-configs-69b85bfc*` vs `*claude-nix-configs-2309b4c6*`),
+  and `schedule-resume` doesn't dedup on cwd the way
+  `resume-all` does. So resuming a dead session whose cwd already has
+  a live one is fine and produces two side-by-side instances — that's
+  often exactly what the user wants ("I had two different threads in
+  this repo"), but ask before doing it silently.
+
+#### The clean way to relaunch: `claude-dashboard-schedule-resume`
+
+```elisp
+(claude-dashboard-schedule-resume CWD SID WHEN-SPEC
+                                  &optional INITIAL-MESSAGE RENAME-NAME)
+```
+
+Equivalent to `claude-dashboard-schedule-launch` with
+`EXTRA-ARGS = ("--resume" SID)`. Three things make this the right
+primitive for bulk resume:
+
+- **WHEN-SPEC** is parsed by `claude-dashboard--parse-time-spec` and
+  accepts `+Ns / +Nm / +Nh / +Nd`, `HH:MM`, `YYYY-MM-DD HH:MM[:SS]`,
+  and `<…>` org-style brackets. `+2s` is the "fire essentially now"
+  idiom — go through the scheduler instead of calling
+  `claude-dashboard--launch` directly so the welcome-banner wait and
+  the followup delivery are wired up for free.
+- **INITIAL-MESSAGE** is delivered automatically
+  `claude-dashboard-pending-launch-followup-delay` seconds (default 8)
+  after the launch fires — which is exactly the welcome-banner-ready
+  delay covered in "Welcome banner as a 'ready' signal" above. So
+  `INITIAL-MESSAGE = "Continue where you left off."` gets you "resumed
+  and pushed forward" in a single call, no separate timer to manage.
+- **RENAME-NAME** (5th arg) sends `/rename <name>` right before the
+  initial message lands, and the package marks the buffer as
+  name-injected so auto-name won't clobber it. Pass the customTitle
+  you scraped from the transcript, so the resumed buffer comes back
+  with the same name the user remembers (`*claude-<cwd>-<sid>*` gets
+  retitled to `*claude-<name>-<sid>*` once the rename lands).
+
+#### Stagger multiple resumes
+
+Each launch creates a fresh eat buffer; firing N at exactly the same
+instant has produced occasional eat-init races (process filter wired
+to the wrong buffer, etc.). Space them 2–3 s apart. The followup
+delay is layered on top of each launch's own start time, so a stagger
+of 3s × 5 launches = ~22s for the last followup to land — that's
+fine for "restart everything I had open".
+
+```elisp
+(let ((msg "Continue where you left off.")
+      (sessions
+       ;; (CWD SID WHEN RENAME) per row.  CWD comes from the
+       ;; transcript's own "cwd" field, NOT from decoding the dir name.
+       '(("/home/amunoz/projects/uoe-kenneth-amiodarone"
+          "d4b2da3e-…" "+2s"  "nb19")
+         ("/home/amunoz/projects/emacs_llm_dashboard"
+          "f649cfdc-…" "+5s"  "emacs-llm")
+         ("/home/amunoz/.local/share/src/nixos-config"
+          "2309b4c6-…" "+8s"  "email"))))
+  (dolist (s sessions)
+    (apply #'claude-dashboard-schedule-resume
+           (nth 0 s) (nth 1 s) (nth 2 s)
+           (list msg (nth 3 s)))))
+```
+
+#### Verification
+
+After ~(last-stagger + followup-delay + ~5s), inspect the live set:
+
+```elisp
+(let (rows)
+  (maphash
+   (lambda (buf inst)
+     (push (list :buffer (buffer-name buf)
+                 :sid (when (claude-dashboard-instance-session-id inst)
+                        (substring (claude-dashboard-instance-session-id inst) 0 8))
+                 :status (claude-dashboard--status inst))
+           rows))
+   claude-dashboard--instances)
+  rows)
+```
+
+Status `idle` for a freshly-resumed session means the followup already
+landed and claude is back at the prompt; `running` means the followup
+is still being processed (claude is reading the transcript and
+thinking through "where it left off"). Both are healthy outcomes —
+absence from the hash table is the failure mode to look for, and the
+fix in that case is usually that the CWD didn't exist on disk
+(`file-directory-p` would have caught it before launch) or that the
+sid was already alive in the dashboard under a different buffer name
+(check `claude-dashboard--instances` for any inst whose `:sid` matches
+before scheduling).
 
 ## `defcustom` doesn't reassign already-bound variables on reload
 
