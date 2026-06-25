@@ -643,11 +643,53 @@ matches the expected context before sending. If it doesn't, abort
 rather than send — letting the user fix the context manually is cheap;
 an out-of-band send isn't recoverable.
 
+### Starting mu4e from a script: `(mu4e t)` not `mu4e--start`
+
+If `mu4e--server-process` isn't live in the daemon, **call the public
+entry `(mu4e t)`** to initialise it — not the internal `mu4e--start`.
+`mu4e--start` only spawns the server; the public `mu4e` entry runs the
+full init sequence (context selection, handler-buffer setup,
+`mu4e--server-handler-buf` binding). Skipping the public entry leaves
+the package half-initialised: the server is alive but
+`mu4e--server-handler-buf` is nil, so every incoming sexp from the mu
+binary dispatches to nil handlers and the filter throws
+`Symbol's function definition is void: nil` on every response.
+
+If `(mu4e t)` errors with `term-width`/`term-height` void, the user's
+init expects those terminal-size variables in their daemon. Shim them
+once globally before calling `(mu4e t)`:
+
+```elisp
+(defvar term-width 80)
+(defvar term-height 80)
+(mu4e t)
+```
+
+That's preferable to `mu4e--start`, which sidesteps the term-size
+checks but leaves you with a half-initialised mu4e.
+
 ### Sending email programmatically
 
 Use `mu4e-compose-mail` to create compose buffers — it properly sets up Fcc
 headers, hooks, and mu4e integration. Using `message-setup` directly skips
 mu4e's machinery (no Fcc, no sent-folder save, no context switching).
+
+**Serialise programmatic sends — never overlap them.** Each
+`mu4e-compose-mail` registers buffer-local handler symbols
+(`mu4e-sent-func`, `mu4e-temp-func`, `mu4e-header-func`,
+`mu4e-compose-func`) and mu4e's server filter dispatches incoming sexps
+through whichever compose buffer is currently bound as
+`mu4e--server-handler-buf`. If you fire several sends in quick
+succession (e.g. a batch of inquiries), the in-flight handler
+buffer can be torn down or replaced before the previous send's
+server ACK arrives. Lost dispatch → `mu4e--server-handler-buf` ends
+up nil → the filter throws `Symbol's function definition is void: nil`
+on every subsequent response, breaking *all* mu4e operations
+(reading mail, sending mail, viewing) until restart. **Pattern: send
+one, wait for `(:sent t)`-equivalent result, sleep ~1s, then send the
+next.** Even better when sending a batch: write a single elisp form
+that loops over the list with `sleep-for` between iterations rather
+than firing N separate `eval-elisp.sh` calls in parallel.
 
 Interactive prompts (`y-or-n-p`, "Fix continuation lines?") hang emacsclient.
 Suppress them with `cl-letf`:
