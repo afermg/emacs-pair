@@ -1,0 +1,23 @@
+{
+  "name": "emacs-pair",
+  "version": "1.0.0",
+  "description": "A Claude Code, Pi, and Codex skill for interacting with a running Emacs session via emacsclient.",
+  "author": "Alan F. Munoz",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:afermg/emacs-pair.git"
+  },
+  "keywords": [
+    "pi-package",
+    "agent-skill",
+    "claude-code-skill",
+    "codex-skill",
+    "emacs"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  }
+}
