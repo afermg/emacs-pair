@@ -871,6 +871,22 @@ Use `mu4e-compose-mail` to create compose buffers — it properly sets up Fcc
 headers, hooks, and mu4e integration. Using `message-setup` directly skips
 mu4e's machinery (no Fcc, no sent-folder save, no context switching).
 
+**Before composing, check for an existing draft/reply buffer that already matches
+what the user wants.** If they say they already have a draft open, or want you to
+edit "the reply to their last email", prefer reusing that buffer over creating a
+new one. This preserves the reply headers, quote context, `In-Reply-To` /
+`References`, and the exact thread they were working in.
+
+Pattern:
+- scan live `message-mode` / `mu4e-compose-mode` buffers first
+- match on recipient + subject, and inspect a short body preview to distinguish
+  lookalike drafts
+- if you find the intended reply draft, edit its body in place and focus it
+- only call `mu4e-compose-mail` / reply constructors if no suitable draft exists
+
+For reply drafts specifically, replace only the user-authored body region and
+leave the quoted `... writes:` block intact.
+
 **Serialise programmatic sends — never overlap them.** Each
 `mu4e-compose-mail` registers buffer-local handler symbols
 (`mu4e-sent-func`, `mu4e-temp-func`, `mu4e-header-func`,
@@ -993,15 +1009,28 @@ before send.** `message-send-and-exit` (and `message-send`) regenerate the
 overwritten in transit, so any link or note recorded from the pre-send buffer
 points at a msgid that never reaches any mbox.
 
-Capture from the Sent maildir instead:
+Capture from the Sent maildir instead. **Best pattern:** record the
+compose buffer's `Fcc` header *before* sending, then convert that maildir into
+an on-disk `cur/` path. **Do not** guess with
+`(mu4e-context-vars-get 'mu4e-sent-folder)` — that's not a public helper, and
+in practice a follow-up eval right after send can wedge and leave a blocked
+`emacsclient`.
 
 ```elisp
-;; Right after message-send-and-exit:
-(let ((sent-dir (expand-file-name "~/.mail/<account>/Sent/cur"))
-      (target-recipient "user@example.com"))
-  ;; Newest file in the Sent folder is usually the one we just sent.
-  ;; Confirm by recipient or subject before trusting it.
-  (let* ((files (sort (directory-files sent-dir t "^[^.]")
+;; Assume `buf` is the compose buffer. Capture Fcc before sending,
+;; then inspect that maildir afterward.
+(let* ((target-recipient "user@example.com")
+       (fcc nil))
+  (with-current-buffer buf
+    ;; e.g. "/broad/Sent" or "/work/[Gmail]/Sent Mail"
+    (setq fcc (message-fetch-field "Fcc"))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+      (message-send-and-exit)))
+  (let* ((sent-dir (expand-file-name (concat "." fcc "/cur") mu4e-maildir))
+         ;; Newest file in the Sent folder is usually the one we just sent.
+         ;; Confirm by recipient or subject before trusting it.
+         (files (sort (directory-files sent-dir t "^[^.]")
                       (lambda (a b)
                         (time-less-p (nth 5 (file-attributes b))
                                      (nth 5 (file-attributes a))))))
@@ -1014,6 +1043,17 @@ Capture from the Sent maildir instead:
                  (re-search-forward "^Message-ID: <\\([^>]+\\)>" nil t))
         (match-string 1)))))
 ```
+
+If Emacs seems touchy immediately after the send, verify from the shell instead
+of doing another Elisp round-trip:
+
+```bash
+mu find 'to:user@example.com and subject:"Subject line"' \
+  --fields "d f s i" --sortfield=date --reverse | head
+```
+
+That gives you the actual indexed Message-ID from the delivered copy without
+probing mu4e context internals again.
 
 Diagnostic: if a link recorded right after a programmatic send fails to
 resolve (`mu find msgid:... → no matches`), this is almost always the cause —
