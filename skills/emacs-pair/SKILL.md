@@ -1998,6 +1998,123 @@ Same pattern applies to any other setting that normally lives in
 that they won't persist across rebuilds. The general rule: if Nix owns
 the dotfile, don't rely on Customize for anything.
 
+## Working with `ghostel` (terminal-emulator buffers)
+
+`ghostel` looks superficially like `eat`, but the automation failure modes are
+very different. The important ones are resource packaging, first-run native
+module prompts, and input injection.
+
+### Custom straight recipes must ship Ghostel's non-Elisp resources
+
+A custom straight / package-vc recipe that only installs `lisp/*.el` is
+insufficient. Ghostel resolves its runtime assets via
+`ghostel--resource-root`, and expects the package root to contain resources like
+`etc/`, `src/`, `vendor/`, `build.zig`, `build.zig.zon`, and `symbols.map`.
+Without them, shell integration, terminfo lookup, and native-module
+compile/download support can fail in confusing ways.
+
+Use a recipe that includes the resource tree, e.g.:
+
+```elisp
+(use-package ghostel
+  :straight (:host github :repo "dakra/ghostel"
+             :files ("lisp/*.el" "etc" "build.zig" "build.zig.zon"
+                     "symbols.map" "src" "vendor")))
+```
+
+### First launch can block on the native-module choice prompt
+
+`ghostel-module-auto-install` defaults to `ask`. On first launch, Ghostel may
+prompt the user to choose between downloading or compiling the native module.
+From `emacsclient --eval`, this often shows up as a mysterious `Quit` or a
+stuck/interactive choice prompt the user sees in Emacs.
+
+For unattended automation, set this ahead of time:
+
+```elisp
+(setq ghostel-module-auto-install 'download)
+```
+
+Or bootstrap the module explicitly before the first terminal launch:
+
+```elisp
+(ghostel-download-module nil)
+```
+
+Useful probe:
+
+```elisp
+(let* ((dir (ghostel--module-directory))
+       (file (and dir
+                  (expand-file-name (concat "ghostel-module"
+                                            module-file-suffix)
+                                    dir))))
+  (list :module-auto-install ghostel-module-auto-install
+        :module-file file
+        :module-exists (and file (file-exists-p file))))
+```
+
+### Use `ghostel-exec` for program launches, not `ghostel`
+
+`ghostel` opens an interactive shell. When driving a specific TUI/CLI program
+(programmatic dashboard session, agent, REPL wrapper), use `ghostel-exec`:
+
+```elisp
+(with-current-buffer buffer
+  (setq-local default-directory cwd))
+(ghostel-exec buffer program args)
+```
+
+This is the Ghostel analogue of `eat-exec`.
+
+### Do not cargo-cult `eat`'s `process-send-string` pattern into Ghostel
+
+For `eat`, `process-send-string` against `(get-buffer-process buf)` is the right
+way to inject input. For `ghostel`, prefer Ghostel's own send functions from
+inside the buffer:
+
+```elisp
+(with-current-buffer ghostel-buffer
+  (ghostel-send-string message)
+  (sit-for 0.05)
+  (ghostel-send-string "\r"))
+```
+
+This matters because Ghostel's local/native PTY path is not just a plain
+`get-buffer-process` write-to-stdin model; the buffer-local lifecycle process is
+tracked in `ghostel--process`. For liveness checks inside Ghostel buffers, use:
+
+```elisp
+(with-current-buffer ghostel-buffer
+  (and (boundp 'ghostel--process)
+       ghostel--process
+       (process-live-p ghostel--process)))
+```
+
+If you are writing generic "terminal backend" code, dispatch on the major mode:
+`ghostel-mode` → `ghostel-send-string`; `eat-mode` → `process-send-string`.
+
+### Project integration from the README can conflict with existing `project.el` bindings
+
+Ghostel's README recommends wiring project commands like this:
+
+```elisp
+(use-package ghostel
+  :bind (:map project-prefix-map
+         ("m" . ghostel-project)
+         ("M" . ghostel-project-list-buffers))
+  :config
+  (add-to-list 'project-switch-commands '(ghostel-project "Ghostel") t)
+  (add-to-list 'project-switch-commands
+               '(ghostel-project-list-buffers "Ghostel buffers") t))
+```
+
+This is good advice, but **check for conflicts before copying it verbatim**.
+Many configs already use `C-x p m` for Magit, and many users already bind `C-x m`
+for something else entirely. When pairing on a live config, inspect
+`project-prefix-map` and existing global bindings first, then pick either the
+README defaults or a non-conflicting alternative.
+
 ## Working with `eat` (terminal-emulator buffers)
 
 `eat` runs a child process inside an Emacs-allocated PTY. The buffer
