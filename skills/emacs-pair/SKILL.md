@@ -905,7 +905,15 @@ that loops over the list with `sleep-for` between iterations rather
 than firing N separate `eval-elisp.sh` calls in parallel.
 
 Interactive prompts (`y-or-n-p`, "Fix continuation lines?") hang emacsclient.
-Suppress them with `cl-letf`:
+Suppress them with `cl-letf`.
+
+**Always kill the compose buffer after a successful programmatic send.** Do not
+assume that `message-send-and-exit` kills it: when
+`message-kill-buffer-on-exit` is nil, Message may only bury the buffer. Keep a
+reference to the compose buffer, let send errors propagate, and only after the
+send returns successfully, kill any still-live compose buffer and verify that
+it is dead. Never perform this cleanup when sending signals an error, because
+the user needs the intact draft to recover or retry.
 
 ```elisp
 ;; Preferred: uses mu4e-compose-mail for full mu4e integration (Fcc, sent folder)
@@ -919,12 +927,23 @@ Suppress them with `cl-letf`:
                                 (with-current-buffer b
                                   (derived-mode-p 'mu4e-compose-mode)))
                               (buffer-list)))))
+    (unless buf (error "Compose buffer not found"))
     (with-current-buffer buf
       (message-goto-body)
       (insert "Body text here.\n")
       (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
                 ((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
-        (message-send-and-exit)))))
+        (message-send-and-exit)))
+    ;; Reaching here means sending returned without error. Message may have
+    ;; buried rather than killed the compose buffer, so enforce cleanup.
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (set-buffer-modified-p nil)
+        (let ((kill-buffer-query-functions nil))
+          (kill-buffer buf))))
+    (when (buffer-live-p buf)
+      (error "Sent message, but compose buffer remained live: %s"
+             (buffer-name buf)))))
 ```
 
 For fire-and-forget sends where you don't need sent-folder integration,
@@ -1027,6 +1046,16 @@ in practice a follow-up eval right after send can wedge and leave a blocked
     (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
               ((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
       (message-send-and-exit)))
+  ;; Sending returned without error. Ensure Message did not merely bury the
+  ;; compose buffer (`message-kill-buffer-on-exit` may be nil).
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (set-buffer-modified-p nil)
+      (let ((kill-buffer-query-functions nil))
+        (kill-buffer buf))))
+  (when (buffer-live-p buf)
+    (error "Sent message, but compose buffer remained live: %s"
+           (buffer-name buf)))
   (let* ((sent-dir (expand-file-name (concat "." fcc "/cur") mu4e-maildir))
          ;; Newest file in the Sent folder is usually the one we just sent.
          ;; Confirm by recipient or subject before trusting it.
